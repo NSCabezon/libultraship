@@ -33,6 +33,9 @@ get_target_property(sdl2_sources SDL2-static SOURCES)
 list(FILTER sdl2_sources INCLUDE REGEX "\\.m$")
 set_source_files_properties(${sdl2_sources} DIRECTORY ${sdl2_SOURCE_DIR} PROPERTIES LANGUAGE OBJC)
 
+# SDL_IsTablet() still references SDL_IsIPad() from the compiled-out UIKit video backend.
+target_sources(SDL2-static PRIVATE ${CMAKE_CURRENT_LIST_DIR}/visionos-sdl-stubs.c)
+
 #=================== nlohmann-json ===================
 FetchContent_Declare(
     nlohmann_json

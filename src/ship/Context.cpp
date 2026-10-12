@@ -1,5 +1,6 @@
 #include "ship/Context.h"
 #include "ship/controller/controldevice/controller/mapping/keyboard/KeyboardScancodes.h"
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -39,6 +40,14 @@ void Context::DestroyInstance() {
     mContext = nullptr;
 }
 
+// spdlog's registry is a function-local static created after mContext, so on exit() it would be
+// destroyed first and the SPDLOG_* calls in the destructors below would use a freed default logger.
+// Tear the context down from an atexit handler registered after the registry exists instead.
+static void RegisterExitTeardown() {
+    spdlog::details::registry::instance();
+    std::atexit(Context::DestroyInstance);
+}
+
 Context::~Context() {
     SPDLOG_TRACE("destruct context");
     GetWindow()->SaveWindowToConfig();
@@ -60,7 +69,9 @@ Context::~Context() {
 #endif
     GetConfig()->Save();
     mConfig = nullptr;
-    mLogger->flush();
+    if (mLogger != nullptr) {
+        mLogger->flush();
+    }
     mLogger = nullptr;
 #ifndef _DEBUG
     mLogThreadPool = nullptr;
@@ -74,6 +85,7 @@ Context* Context::CreateInstance(const std::string& name, const std::string& sho
                                  std::shared_ptr<ControlDeck> controlDeck) {
     if (mContext == nullptr) {
         mContext = std::make_unique<Context>(name, shortName, configFilePath);
+        RegisterExitTeardown();
         if (mContext->Init(archivePaths, validHashes, reservedThreadCount, audioSettings, window, controlDeck)) {
             return mContext.get();
         } else {
@@ -91,6 +103,7 @@ Context* Context::CreateUninitializedInstance(const std::string& name, const std
                                               const std::string& configFilePath) {
     if (mContext == nullptr) {
         mContext = std::make_unique<Context>(name, shortName, configFilePath);
+        RegisterExitTeardown();
         return mContext.get();
     }
 
