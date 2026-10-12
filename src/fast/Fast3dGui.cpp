@@ -116,8 +116,13 @@ void HostUpdateGamepads() {
                 }
             }
         }
-        SPDLOG_INFO("[HostImGui] {} gamepad(s) bound (Create/Share = SDL BACK toggles the menu)",
-                    sHostPlatform.Gamepads.size());
+        // The list is refreshed periodically; only log when the bound set changes.
+        static size_t sLoggedGamepadCount = SIZE_MAX;
+        if (sHostPlatform.Gamepads.size() != sLoggedGamepadCount) {
+            sLoggedGamepadCount = sHostPlatform.Gamepads.size();
+            SPDLOG_INFO("[HostImGui] {} gamepad(s) bound (Create/Share = SDL BACK toggles the menu)",
+                        sLoggedGamepadCount);
+        }
         sHostPlatform.WantUpdateGamepadsList = false;
     }
 
