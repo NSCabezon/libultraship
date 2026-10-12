@@ -13,6 +13,16 @@
 #include <imgui_impl_sdl2.h>
 #include <simd/simd.h>
 
+#include <atomic>
+#include <condition_variable>
+#include <cstdio>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
 static constexpr size_t kMaxVertexBufferPoolSize = 3;
 // Room for one frame of triangles per buffer, per eye on visionOS (stereo renders two passes).
 #ifdef __VISIONOS__
@@ -37,6 +47,7 @@ class Device;
 class Function;
 class Buffer;
 class RenderPipelineState;
+class RenderPipelineDescriptor;
 class ComputePipelineState;
 class CommandQueue;
 class Viewport;
@@ -74,8 +85,34 @@ struct ShaderProgramMetal {
     bool usedTextures[SHADER_MAX_TEXTURES];
     bool markedForDeletion = false;
 
-    // hashed by msaa_level
+    // hashed by msaa_level; variants are created on first use (or by the precompiler)
     MTL::RenderPipelineState* pipeline_state_variants[9];
+    // Kept to create further msaa variants later; owned (retained) by the program.
+    MTL::RenderPipelineDescriptor* pipelineDescriptor = nullptr;
+    uint32_t cacheFlags = 0; // ShaderCacheFlags it was built with
+};
+
+// Persistent shader cache (shader-cache.txt in the app directory): every Fast3D shader and msaa
+// variant used is recorded once; on the next launch a background thread compiles them before
+// the game asks for them. flags = what else changes the generated source or the pipeline.
+enum ShaderCacheFlags : uint32_t {
+    SHADER_CACHE_THREE_POINT = 1 << 0,
+    SHADER_CACHE_SRGB = 1 << 1,
+};
+
+struct ShaderCacheKey {
+    uint64_t id0;
+    uint64_t id1;
+    uint32_t flags;
+    bool operator==(const ShaderCacheKey& o) const {
+        return id0 == o.id0 && id1 == o.id1 && flags == o.flags;
+    }
+};
+
+struct ShaderCacheKeyHash {
+    size_t operator()(const ShaderCacheKey& k) const {
+        return std::hash<uint64_t>()(k.id0 * 31 + k.id1) ^ ((size_t)k.flags << 1);
+    }
 };
 
 struct TextureDataMetal {
@@ -136,7 +173,7 @@ struct CoordUniforms {
 
 class GfxRenderingAPIMetal final : public GfxRenderingAPI {
   public:
-    ~GfxRenderingAPIMetal() override = default;
+    ~GfxRenderingAPIMetal() override;
     const char* GetName() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;
@@ -202,6 +239,16 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void SetupScreenFramebuffer(uint32_t width, uint32_t height);
     void SetupHostOutputTexture(int eye, uint32_t width, uint32_t height);
     void EndEye();
+    // Shader cache (see ShaderCacheKey).
+    uint32_t CurrentShaderCacheFlags() const;
+    bool BuildShaderProgram(const ShaderCacheKey& key, uint32_t msaaMask, ShaderProgramMetal& prg,
+                            double* libraryMs, double* pipelinesMs);
+    MTL::RenderPipelineState* CreatePipelineVariant(ShaderProgramMetal& prg, int msaaLevel);
+    MTL::RenderPipelineState* PipelineForMsaa(ShaderProgramMetal& prg, int msaaLevel);
+    void RecordShaderUse(const ShaderCacheKey& key, int msaaLevel);
+    void StartShaderPrecompile();
+    void ShaderPrecompileLoop();
+    bool TakePrecompiledShader(const ShaderCacheKey& key, ShaderProgramMetal& prg);
     void PresentHostOutput(MTL::CommandBuffer* commandBuffer);
 #ifdef __VISIONOS__
     void DumpHostOutput(int eye, uint64_t frameNumber);
@@ -268,6 +315,21 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     int mCurrentEye = 0;
     int mEyeCount = 1;
     uint64_t mHostFrameIndex = 0;
+
+    // Shader cache: record file (game thread only), background precompile state (mPrecompileMutex).
+    bool mShaderCacheStarted = false;
+    FILE* mShaderCacheFile = nullptr;
+    std::unordered_map<ShaderCacheKey, uint32_t, ShaderCacheKeyHash> mShaderCacheRecorded; // key -> msaa mask
+    std::mutex mPrecompileMutex;
+    std::condition_variable mPrecompileCv;
+    std::vector<std::pair<ShaderCacheKey, uint32_t>> mPrecompileQueue; // first-use order, msaa mask
+    size_t mPrecompileNext = 0;
+    uint32_t mPrecompileGeneration = 0; // bumped by ClearShaderCache: in-flight results are dropped
+    std::unordered_map<ShaderCacheKey, ShaderProgramMetal, ShaderCacheKeyHash> mPrecompiled;
+    std::unordered_set<ShaderCacheKey, ShaderCacheKeyHash> mPrecompileSkip; // claimed by the game thread
+    std::unordered_set<ShaderCacheKey, ShaderCacheKeyHash> mPrecompileInFlight;
+    std::atomic<bool> mPrecompileStop{ false };
+    std::vector<std::thread> mPrecompileThreads;
 };
 
 } // namespace Fast

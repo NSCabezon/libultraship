@@ -16,6 +16,8 @@
 #include <time.h>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <pthread.h>
 #include <math.h>
 #include <cmath>
 #include <stddef.h>
@@ -258,31 +260,124 @@ void GfxRenderingAPIMetal::LoadShader(struct ShaderProgram* new_prg) {
     mShaderProgram = (struct ShaderProgramMetal*)new_prg;
 }
 
+// MARK: - Shader cache
+
+// gfx_metal_build_shader keeps the vertex layout it builds in globals: one generator at a time.
+static std::mutex sShaderGenMutex;
+
+using PerfMs = std::chrono::duration<double, std::milli>;
+
+// SOH_PERF_LOG: log every shader/pipeline compile with its cost and thread.
+static bool ShaderPerfLog() {
+    static const bool sPerfLog = getenv("SOH_PERF_LOG") != nullptr;
+    return sPerfLog;
+}
+
+static const char* const kShaderCacheFile = "shader-cache.txt";
+static const char* const kShaderCacheSeed = "assets/shader-cache-seed.txt";
+static const char* const kShaderCacheHeader = "# SoH Metal shader cache v1: id0 id1 flags msaa (hex hex hex dec)\n";
+
+// Appends the entries of a shader cache file in file order, merging msaa levels per key.
+static void ReadShaderCacheFile(const std::string& path, std::vector<std::pair<ShaderCacheKey, uint32_t>>& entries,
+                                std::unordered_map<ShaderCacheKey, size_t, ShaderCacheKeyHash>& index) {
+    FILE* file = fopen(path.c_str(), "r");
+    if (file == nullptr) {
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), file) != nullptr) {
+        unsigned long long id0, id1;
+        unsigned int flags;
+        int msaa;
+        if (line[0] == '#' || sscanf(line, "%llx %llx %x %d", &id0, &id1, &flags, &msaa) != 4 || msaa < 1 ||
+            msaa > (int)METAL_MAX_MULTISAMPLE_SAMPLE_COUNT) {
+            continue;
+        }
+        const ShaderCacheKey key = { id0, id1, flags };
+        auto it = index.find(key);
+        if (it == index.end()) {
+            index.emplace(key, entries.size());
+            entries.emplace_back(key, 1u << msaa);
+        } else {
+            entries[it->second].second |= 1u << msaa;
+        }
+    }
+    fclose(file);
+}
+
+static void ReleaseShaderProgram(ShaderProgramMetal& prg) {
+    for (MTL::RenderPipelineState*& state : prg.pipeline_state_variants) {
+        if (state != nullptr) {
+            state->release();
+            state = nullptr;
+        }
+    }
+    if (prg.pipelineDescriptor != nullptr) {
+        prg.pipelineDescriptor->release();
+        prg.pipelineDescriptor = nullptr;
+    }
+}
+
 void GfxRenderingAPIMetal::ClearShaderCache() {
     for (auto& [key, prg] : mShaderProgramPool) {
         prg.markedForDeletion = true;
     }
+    // Custom shaders may have changed what an id compiles to: drop everything precompiled.
+    std::lock_guard<std::mutex> lock(mPrecompileMutex);
+    mPrecompileGeneration++;
+    for (auto& [key, prg] : mPrecompiled) {
+        ReleaseShaderProgram(prg);
+    }
+    mPrecompiled.clear();
+    mPrecompileQueue.clear();
+    mPrecompileNext = 0;
 }
 
-struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
-    const auto compileStart = std::chrono::steady_clock::now();
+GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
+    mPrecompileStop = true;
+    for (std::thread& thread : mPrecompileThreads) {
+        thread.join();
+    }
+    if (mShaderCacheFile != nullptr) {
+        fclose(mShaderCacheFile);
+    }
+}
+
+uint32_t GfxRenderingAPIMetal::CurrentShaderCacheFlags() const {
+    return (mCurrentFilterMode == FILTER_THREE_POINT ? SHADER_CACHE_THREE_POINT : 0) |
+           (mSrgbMode ? SHADER_CACHE_SRGB : 0);
+}
+
+// Generates and compiles the shader of key and its pipelines for the msaa levels in msaaMask
+// (bit n = n samples). Thread-safe: touches nothing but prg and the device.
+bool GfxRenderingAPIMetal::BuildShaderProgram(const ShaderCacheKey& key, uint32_t msaaMask, ShaderProgramMetal& prg,
+                                              double* libraryMs, double* pipelinesMs) {
     CCFeatures cc_features;
-    gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
+    gfx_cc_get_features(key.id0, key.id1, &cc_features);
 
     size_t numFloats = 0;
     std::string buf;
     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
 
-    MTL::VertexDescriptor* vertex_descriptor =
-        gfx_metal_build_shader(buf, numFloats, cc_features, mCurrentFilterMode == FILTER_THREE_POINT);
+    MTL::VertexDescriptor* vertex_descriptor;
+    {
+        std::lock_guard<std::mutex> lock(sShaderGenMutex);
+        vertex_descriptor =
+            gfx_metal_build_shader(buf, numFloats, cc_features, (key.flags & SHADER_CACHE_THREE_POINT) != 0);
+    }
 
+    const auto libraryStart = std::chrono::steady_clock::now();
     NS::Error* error = nullptr;
     MTL::Library* library =
         mDevice->newLibrary(NS::String::string(buf.data(), NS::UTF8StringEncoding), nullptr, &error);
+    *libraryMs = PerfMs(std::chrono::steady_clock::now() - libraryStart).count();
 
-    if (error != nullptr)
+    if (library == nullptr) {
         SPDLOG_ERROR("Failed to compile shader library, error {}",
-                     error->localizedDescription()->cString(NS::UTF8StringEncoding));
+                     error != nullptr ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "?");
+        autorelease_pool->release();
+        return false;
+    }
 
     MTL::RenderPipelineDescriptor* pipeline_descriptor = MTL::RenderPipelineDescriptor::alloc()->init();
     MTL::Function* vertexFunc = library->newFunction(NS::String::string("vertexShader", NS::UTF8StringEncoding));
@@ -292,8 +387,8 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
     pipeline_descriptor->setFragmentFunction(fragmentFunc);
     pipeline_descriptor->setVertexDescriptor(vertex_descriptor);
 
-    pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB
-                                                                                 : MTL::PixelFormatBGRA8Unorm);
+    pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(
+        (key.flags & SHADER_CACHE_SRGB) != 0 ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
     pipeline_descriptor->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
     if (cc_features.opt_alpha) {
         pipeline_descriptor->colorAttachments()->object(0)->setBlendingEnabled(true);
@@ -310,52 +405,235 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
         pipeline_descriptor->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
     }
 
-    struct ShaderProgramMetal* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
-    prg->shader_id0 = shader_id0;
-    prg->shader_id1 = shader_id1;
-    prg->usedTextures[0] = cc_features.usedTextures[0];
-    prg->usedTextures[1] = cc_features.usedTextures[1];
-    prg->usedTextures[2] = cc_features.used_masks[0];
-    prg->usedTextures[3] = cc_features.used_masks[1];
-    prg->usedTextures[4] = cc_features.used_blend[0];
-    prg->usedTextures[5] = cc_features.used_blend[1];
-    prg->numInputs = cc_features.numInputs;
-    prg->numFloats = numFloats;
+    prg.shader_id0 = key.id0;
+    prg.shader_id1 = key.id1;
+    prg.usedTextures[0] = cc_features.usedTextures[0];
+    prg.usedTextures[1] = cc_features.usedTextures[1];
+    prg.usedTextures[2] = cc_features.used_masks[0];
+    prg.usedTextures[3] = cc_features.used_masks[1];
+    prg.usedTextures[4] = cc_features.used_blend[0];
+    prg.usedTextures[5] = cc_features.used_blend[1];
+    prg.numInputs = cc_features.numInputs;
+    prg.numFloats = numFloats;
+    prg.cacheFlags = key.flags;
+    prg.pipelineDescriptor = pipeline_descriptor; // retains the functions
 
-    // Prepoluate pipeline state cache with program and available msaa levels
-    for (int i = 0; i < ARRAY_COUNT(mMsaaNumQualityLevels); i++) {
-        if (mMsaaNumQualityLevels[i] == 1) {
-            int msaa_level = i + 1;
-            pipeline_descriptor->setSampleCount(msaa_level);
-            MTL::RenderPipelineState* pipeline_state = mDevice->newRenderPipelineState(pipeline_descriptor, &error);
-
-            if (!pipeline_state || error != nullptr) {
-                // Pipeline State creation could fail if we haven't properly set up our pipeline descriptor.
-                // If the Metal API validation is enabled, we can find out more information about what
-                // went wrong.  (Metal API validation is enabled by default when a debug build is run
-                // from Xcode)
-                SPDLOG_ERROR("Failed to create pipeline state, error {}",
-                             error->localizedDescription()->cString(NS::UTF8StringEncoding));
-            }
-
-            prg->pipeline_state_variants[msaa_level] = pipeline_state;
+    // Only the msaa levels asked for: the others are created if and when a framebuffer uses them.
+    const auto pipelinesStart = std::chrono::steady_clock::now();
+    for (int msaa_level = 1; msaa_level <= (int)METAL_MAX_MULTISAMPLE_SAMPLE_COUNT; msaa_level++) {
+        if ((msaaMask & (1u << msaa_level)) != 0 && mMsaaNumQualityLevels[msaa_level - 1] == 1) {
+            CreatePipelineVariant(prg, msaa_level);
         }
     }
-
-    LoadShader((struct ShaderProgram*)prg);
+    *pipelinesMs = PerfMs(std::chrono::steady_clock::now() - pipelinesStart).count();
 
     vertexFunc->release();
     fragmentFunc->release();
     library->release();
-    pipeline_descriptor->release();
     autorelease_pool->release();
+    return true;
+}
 
-    // SOH_PERF_LOG: shaders are compiled from source on first use, on the game thread (frame hitches).
-    static const bool sPerfLog = getenv("SOH_PERF_LOG") != nullptr;
-    if (sPerfLog) {
-        SPDLOG_INFO("[Perf] shader {:016x}/{:016x} compiled in {:.1f} ms ({} total)", shader_id0, shader_id1,
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart).count(),
-                    mShaderProgramPool.size());
+MTL::RenderPipelineState* GfxRenderingAPIMetal::CreatePipelineVariant(ShaderProgramMetal& prg, int msaaLevel) {
+    NS::Error* error = nullptr;
+    prg.pipelineDescriptor->setSampleCount(msaaLevel);
+    MTL::RenderPipelineState* pipeline_state = mDevice->newRenderPipelineState(prg.pipelineDescriptor, &error);
+
+    if (!pipeline_state || error != nullptr) {
+        // Pipeline State creation could fail if we haven't properly set up our pipeline descriptor.
+        // If the Metal API validation is enabled, we can find out more information about what
+        // went wrong.  (Metal API validation is enabled by default when a debug build is run
+        // from Xcode)
+        SPDLOG_ERROR("Failed to create pipeline state, error {}",
+                     error != nullptr ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "?");
+    }
+
+    prg.pipeline_state_variants[msaaLevel] = pipeline_state;
+    return pipeline_state;
+}
+
+// Game thread: the program's pipeline for msaaLevel, created (and recorded) on first use.
+MTL::RenderPipelineState* GfxRenderingAPIMetal::PipelineForMsaa(ShaderProgramMetal& prg, int msaaLevel) {
+    MTL::RenderPipelineState* pipeline_state = prg.pipeline_state_variants[msaaLevel];
+    if (pipeline_state != nullptr || prg.pipelineDescriptor == nullptr) {
+        return pipeline_state;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    pipeline_state = CreatePipelineVariant(prg, msaaLevel);
+    RecordShaderUse({ prg.shader_id0, prg.shader_id1, prg.cacheFlags }, msaaLevel);
+    if (ShaderPerfLog()) {
+        SPDLOG_INFO("[Perf] pipeline {:016x}/{:016x} msaa {} created on the game thread in {:.1f} ms",
+                    prg.shader_id0, prg.shader_id1, msaaLevel, PerfMs(std::chrono::steady_clock::now() - start).count());
+    }
+    return pipeline_state;
+}
+
+// Game thread: appends key/msaaLevel to the cache file the first time it is used.
+void GfxRenderingAPIMetal::RecordShaderUse(const ShaderCacheKey& key, int msaaLevel) {
+    uint32_t& mask = mShaderCacheRecorded[key];
+    if ((mask & (1u << msaaLevel)) != 0) {
+        return;
+    }
+    mask |= 1u << msaaLevel;
+    if (mShaderCacheFile != nullptr) {
+        fprintf(mShaderCacheFile, "%016llx %016llx %x %d\n", (unsigned long long)key.id0,
+                (unsigned long long)key.id1, key.flags, msaaLevel);
+        fflush(mShaderCacheFile);
+    }
+}
+
+// Game thread, first shader request (filter mode and sRGB are final by then): loads the cache
+// file and the bundled seed, opens the file for appending and starts the background compile.
+void GfxRenderingAPIMetal::StartShaderPrecompile() {
+    if (mShaderCacheStarted) {
+        return;
+    }
+    mShaderCacheStarted = true;
+
+    const std::string path = Ship::Context::GetPathRelativeToAppDirectory(kShaderCacheFile);
+    std::vector<std::pair<ShaderCacheKey, uint32_t>> entries;
+    std::unordered_map<ShaderCacheKey, size_t, ShaderCacheKeyHash> index;
+    ReadShaderCacheFile(path, entries, index);
+    const size_t recordedCount = entries.size();
+    for (const auto& [key, mask] : entries) {
+        mShaderCacheRecorded[key] = mask;
+    }
+    ReadShaderCacheFile(Ship::Context::GetPathRelativeToAppBundle(kShaderCacheSeed), entries, index);
+    const size_t seedCount = entries.size() - recordedCount;
+
+    const bool isNew = recordedCount == 0;
+    mShaderCacheFile = fopen(path.c_str(), "a");
+    if (mShaderCacheFile == nullptr) {
+        SPDLOG_WARN("[ShaderCache] cannot write {}", path);
+    } else if (isNew) {
+        fputs(kShaderCacheHeader, mShaderCacheFile);
+        fflush(mShaderCacheFile);
+    }
+
+    // Entries built for another filter mode or color format would not match any request.
+    const uint32_t flags = CurrentShaderCacheFlags();
+    std::vector<std::pair<ShaderCacheKey, uint32_t>> queue;
+    for (const auto& entry : entries) {
+        if (entry.first.flags == flags) {
+            queue.push_back(entry);
+        }
+    }
+    const char* env = getenv("SOH_SHADER_PRECOMPILE");
+    const bool enabled = env == nullptr || strcmp(env, "0") != 0;
+    SPDLOG_INFO("[ShaderCache] {}: {} recorded, {} from the bundled seed, {} to precompile{}", path, recordedCount,
+                seedCount, queue.size(), enabled ? "" : " (disabled by SOH_SHADER_PRECOMPILE=0)");
+    if (!enabled || queue.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mPrecompileMutex);
+        mPrecompileQueue = std::move(queue);
+        mPrecompileNext = 0;
+    }
+    // Two workers: the Metal compiler service compiles requests in parallel.
+    for (int i = 0; i < 2; i++) {
+        mPrecompileThreads.emplace_back(&GfxRenderingAPIMetal::ShaderPrecompileLoop, this);
+    }
+}
+
+void GfxRenderingAPIMetal::ShaderPrecompileLoop() {
+    pthread_setname_np("SoH shader precompile");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    const auto start = std::chrono::steady_clock::now();
+    int compiled = 0;
+    double maxMs = 0;
+    while (!mPrecompileStop) {
+        ShaderCacheKey key;
+        uint32_t mask;
+        uint32_t generation;
+        {
+            std::lock_guard<std::mutex> lock(mPrecompileMutex);
+            while (mPrecompileNext < mPrecompileQueue.size() &&
+                   mPrecompileSkip.count(mPrecompileQueue[mPrecompileNext].first) != 0) {
+                mPrecompileNext++;
+            }
+            if (mPrecompileNext >= mPrecompileQueue.size()) {
+                break;
+            }
+            key = mPrecompileQueue[mPrecompileNext].first;
+            mask = mPrecompileQueue[mPrecompileNext].second;
+            mPrecompileNext++;
+            mPrecompileInFlight.insert(key);
+            generation = mPrecompileGeneration;
+        }
+
+        const auto shaderStart = std::chrono::steady_clock::now();
+        ShaderProgramMetal prg = {};
+        double libraryMs = 0, pipelinesMs = 0;
+        const bool ok = BuildShaderProgram(key, mask, prg, &libraryMs, &pipelinesMs);
+        const double ms = PerfMs(std::chrono::steady_clock::now() - shaderStart).count();
+        maxMs = std::max(maxMs, ms);
+        compiled++;
+        if (ShaderPerfLog()) {
+            SPDLOG_INFO("[Perf] shader {:016x}/{:016x} precompiled in background in {:.1f} ms (library {:.1f}, "
+                        "pipelines {:.1f})",
+                        key.id0, key.id1, ms, libraryMs, pipelinesMs);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mPrecompileMutex);
+            mPrecompileInFlight.erase(key);
+            if (ok && generation == mPrecompileGeneration) {
+                mPrecompiled.emplace(key, prg);
+            } else {
+                ReleaseShaderProgram(prg);
+            }
+        }
+        mPrecompileCv.notify_all();
+    }
+    SPDLOG_INFO("[ShaderCache] worker precompiled {} shaders in background in {:.0f} ms (slowest {:.1f} ms)", compiled,
+                PerfMs(std::chrono::steady_clock::now() - start).count(), maxMs);
+}
+
+// Game thread: takes key's program from the precompiler (waiting if it is compiling it right now)
+// and stops the precompiler from starting it later.
+bool GfxRenderingAPIMetal::TakePrecompiledShader(const ShaderCacheKey& key, ShaderProgramMetal& prg) {
+    std::unique_lock<std::mutex> lock(mPrecompileMutex);
+    mPrecompileSkip.insert(key);
+    mPrecompileCv.wait(lock, [&] { return mPrecompileInFlight.count(key) == 0; });
+    auto it = mPrecompiled.find(key);
+    if (it == mPrecompiled.end()) {
+        return false;
+    }
+    prg = it->second;
+    mPrecompiled.erase(it);
+    return true;
+}
+
+struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+    StartShaderPrecompile();
+
+    const auto start = std::chrono::steady_clock::now();
+    const ShaderCacheKey key = { shader_id0, shader_id1, CurrentShaderCacheFlags() };
+    const int msaa_level = mFramebuffers[mCurrentFramebuffer].mMsaaLevel;
+
+    ShaderProgramMetal built = {};
+    double libraryMs = 0, pipelinesMs = 0;
+    const bool precompiled = TakePrecompiledShader(key, built);
+    if (!precompiled) {
+        BuildShaderProgram(key, 1u << msaa_level, built, &libraryMs, &pipelinesMs);
+    }
+
+    struct ShaderProgramMetal* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
+    *prg = built;
+    PipelineForMsaa(*prg, msaa_level);
+    RecordShaderUse(key, msaa_level);
+    LoadShader((struct ShaderProgram*)prg);
+
+    if (ShaderPerfLog()) {
+        const double ms = PerfMs(std::chrono::steady_clock::now() - start).count();
+        if (precompiled) {
+            SPDLOG_INFO("[Perf] shader {:016x}/{:016x} ready from precompile in {:.1f} ms ({} total)", shader_id0,
+                        shader_id1, ms, mShaderProgramPool.size());
+        } else {
+            SPDLOG_INFO("[Perf] shader {:016x}/{:016x} compiled on the game thread in {:.1f} ms (library {:.1f}, "
+                        "pipeline msaa {} {:.1f}) ({} total)",
+                        shader_id0, shader_id1, ms, libraryMs, msaa_level, pipelinesMs, mShaderProgramPool.size());
+        }
     }
     return (struct ShaderProgram*)prg;
 }
@@ -599,8 +877,7 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
     if (current_framebuffer.mLastShaderProgram != mShaderProgram) {
         current_framebuffer.mLastShaderProgram = mShaderProgram;
 
-        MTL::RenderPipelineState* pipeline_state =
-            mShaderProgram->pipeline_state_variants[current_framebuffer.mMsaaLevel];
+        MTL::RenderPipelineState* pipeline_state = PipelineForMsaa(*mShaderProgram, current_framebuffer.mMsaaLevel);
         current_framebuffer.mCommandEncoder->setRenderPipelineState(pipeline_state);
     }
 

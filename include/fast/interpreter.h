@@ -454,6 +454,7 @@ class Interpreter {
     void ImportTextureRaw(int tile, bool importReplacement);
     void ImportTextureImg(int tile, bool importReplacement);
     void ImportTexture(int i, int tile, bool importReplacement);
+    void ImportTextureImpl(int i, int tile, bool importReplacement);
     void ImportTextureMask(int i, int tile);
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
 

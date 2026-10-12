@@ -72,6 +72,17 @@ std::stack<std::string> currentDir;
 
 namespace Fast {
 
+// SOH_PERF_LOG: logs first-use work on the game thread that takes 2 ms or more (texture
+// decode + upload, texture resource loads), the non-shader source of first-use hitches.
+static bool PerfLogEnabled() {
+    static const bool sEnabled = getenv("SOH_PERF_LOG") != nullptr;
+    return sEnabled;
+}
+
+static double PerfMsSince(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
 
 const static uint32_t f3dex2AttrHandler[] = {
@@ -1202,6 +1213,22 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 }
 
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
+    if (PerfLogEnabled()) {
+        const auto start = std::chrono::steady_clock::now();
+        ImportTextureImpl(i, tile, importReplacement);
+        const double ms = PerfMsSince(start);
+        if (ms >= 2.0) {
+            const RawTexMetadata& meta = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
+            SPDLOG_INFO("[Perf] texture import {:.1f} ms: fmt {} siz {} raw {}x{} {}", ms,
+                        mRdp->texture_tile[tile].fmt, mRdp->texture_tile[tile].siz, meta.width, meta.height,
+                        meta.resource != nullptr ? meta.resource->GetInitData()->Path : std::string("(rom)"));
+        }
+        return;
+    }
+    ImportTextureImpl(i, tile, importReplacement);
+}
+
+void Interpreter::ImportTextureImpl(int i, int tile, bool importReplacement) {
     uint8_t fmt = mRdp->texture_tile[tile].fmt;
     uint8_t siz = mRdp->texture_tile[tile].siz;
     uint32_t texFlags = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags;
@@ -4071,8 +4098,16 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
+            const auto loadStart = std::chrono::steady_clock::now();
             std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
                 Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(imgData));
+            if (PerfLogEnabled()) {
+                const double ms = PerfMsSince(loadStart);
+                if (ms >= 2.0) {
+                    SPDLOG_INFO("[Perf] texture resource load {:.1f} ms: {} ({}x{})", ms, imgData,
+                                tex != nullptr ? tex->Width : 0, tex != nullptr ? tex->Height : 0);
+                }
+            }
 
             if (tex == nullptr) {
                 (*cmd0)++;
