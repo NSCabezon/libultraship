@@ -11,7 +11,7 @@ option(NON_PORTABLE "Build a non-portable version" OFF)
 option(DISABLE_DLL_LOADER "Disable dynamic library loading support" OFF)
 option(ENABLE_SCRIPTING "Enable TCC-based C mod compilation and scripting system" OFF)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(CMAKE_SYSTEM_NAME MATCHES "^(iOS|visionOS)$")
     if(ENABLE_SCRIPTING)
         message(FATAL_ERROR "ENABLE_SCRIPTING is unsupported on iOS")
     endif()
@@ -22,7 +22,7 @@ endif()
 
 project(libultraship LANGUAGES C CXX)
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (CMAKE_SYSTEM_NAME MATCHES "^(Darwin|iOS|visionOS)$")
     enable_language(OBJCXX)
     set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc")
     set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fobjc-arc")
@@ -61,6 +61,10 @@ endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     include(cmake/dependencies/ios.cmake)
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+    include(cmake/dependencies/visionos.cmake)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

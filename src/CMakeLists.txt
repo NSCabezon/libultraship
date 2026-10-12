@@ -55,7 +55,7 @@ add_subdirectory("libultraship")
 
 add_subdirectory("ship")
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (CMAKE_SYSTEM_NAME MATCHES "^(Darwin|iOS|visionOS)$")
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/ship/utils/AppleFolderManager.mm PROPERTIES COMPILE_FLAGS -fno-objc-arc)
 endif()
 
@@ -72,7 +72,7 @@ target_include_directories(libultraship
 
 #=================== Linking ===================
 if(INCLUDE_MPQ_SUPPORT)
-    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    if (NOT CMAKE_SYSTEM_NAME MATCHES "^(Windows|iOS|visionOS)$")
         target_link_libraries(libultraship PUBLIC "$<LINK_LIBRARY:WHOLE_ARCHIVE,storm>")
     else()
         target_link_libraries(libultraship PUBLIC storm)
@@ -110,7 +110,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 
 endif()
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (CMAKE_SYSTEM_NAME MATCHES "^(Darwin|iOS|visionOS)$")
     find_Library(OSX_FOUNDATION Foundation)
     find_Library(OSX_AVFOUNDATION AVFoundation)
     find_library(METAL Metal)
@@ -173,15 +173,20 @@ if(NOT SPDLOG_MIN_CUTOFF IN_LIST LOG_LEVELS)
     message(FATAL_ERROR "SPDLOG_MIN_CUTOFF must be one of ${LOG_LEVELS}")
 endif()
 
-if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (CMAKE_SYSTEM_NAME MATCHES "^(iOS|visionOS)$")
+    # visionOS keeps the iOS code paths (__IOS__) and adds __VISIONOS__ where it differs.
     target_compile_definitions(libultraship PRIVATE
         $<$<CONFIG:Debug>:_DEBUG>
         $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
         SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
         __IOS__
+        $<$<STREQUAL:${CMAKE_SYSTEM_NAME},visionOS>:__VISIONOS__>
     )
 
-    set_xcode_property(${PROJECT_NAME} PRODUCT_BUNDLE_IDENTIFIER ${BUNDLE_ID} All)
+    if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        # set_xcode_property comes from the ios-cmake toolchain (not used on visionOS).
+        set_xcode_property(${PROJECT_NAME} PRODUCT_BUNDLE_IDENTIFIER ${BUNDLE_ID} All)
+    endif()
 
     if(NOT SIGN_LIBRARY)
         set_target_properties(${PROJECT_NAME} PROPERTIES

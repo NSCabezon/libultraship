@@ -39,5 +39,13 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "graphic/Fast3D/backends/gfx_opengl*")
 endif()
 
+# visionOS has no SDL window: gfx_host replaces gfx_sdl2 and there is no OpenGL.
+if (CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_sdl2\\.cpp$")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_opengl[^/]*\\.cpp$")
+else()
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_host\\.cpp$")
+endif()
+
 source_group("graphic" FILES ${Source_Files__Graphic})
 target_sources(libultraship PRIVATE ${Source_Files__Graphic})

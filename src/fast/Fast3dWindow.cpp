@@ -6,6 +6,7 @@
 #include "ship/config/ConsoleVariable.h"
 #include "fast/interpreter.h"
 #include "fast/backends/gfx_sdl.h"
+#include "fast/backends/gfx_host_backend.h"
 #include "fast/backends/gfx_dxgi.h"
 #include "fast/backends/gfx_opengl.h"
 #include "fast/backends/gfx_metal.h"
@@ -31,12 +32,16 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
 #ifdef _WIN32
     AddAvailableWindowBackend(WindowBackend::FAST3D_DXGI_DX11);
 #endif
+#ifdef __VISIONOS__
+    AddAvailableWindowBackend(WindowBackend::FAST3D_HOST_METAL);
+#else
 #ifdef __APPLE__
     if (Metal_IsSupported()) {
         AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_METAL);
     }
 #endif
     AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+#endif
 }
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
@@ -163,10 +168,16 @@ void Fast3dWindow::InitWindowManager() {
             mWindowManagerApi = new GfxWindowBackendSDL2();
             break;
 #endif
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(__VISIONOS__)
         case WindowBackend::FAST3D_SDL_METAL:
             mRenderingApi = new GfxRenderingAPIMetal();
             mWindowManagerApi = new GfxWindowBackendSDL2();
+            break;
+#endif
+#ifdef __VISIONOS__
+        case WindowBackend::FAST3D_HOST_METAL:
+            mRenderingApi = new GfxRenderingAPIMetal();
+            mWindowManagerApi = new GfxWindowBackendHost();
             break;
 #endif
         default:
@@ -414,6 +425,7 @@ std::string Fast3dWindow::GetWindowBackendName() {
         case WindowBackend::FAST3D_SDL_OPENGL:
             return "OpenGL";
         case WindowBackend::FAST3D_SDL_METAL:
+        case WindowBackend::FAST3D_HOST_METAL:
             return "Metal";
         default:
             return "";

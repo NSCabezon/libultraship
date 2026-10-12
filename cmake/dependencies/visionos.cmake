@@ -1,0 +1,105 @@
+include(FetchContent)
+
+# visionOS dependencies. Same pins as ios.cmake, but every dependency is always
+# fetched (never a host package) and SDL2 is built without video: the host app
+# owns the window and SDL only provides audio, controllers and the event queue.
+
+#=================== SDL2 ===================
+set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+set(SDL_STATIC ON CACHE BOOL "" FORCE)
+set(SDL_TEST OFF CACHE BOOL "" FORCE)
+set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+set(SDL_MISC OFF CACHE BOOL "" FORCE)
+set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
+set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+set(SDL_METAL OFF CACHE BOOL "" FORCE)
+# SDL 2.32's CMake does not add hidapi/ios/hid.m for visionOS (undefined
+# PLATFORM_hid_* at link time). On Apple mobile HIDAPI only adds Steam
+# Controllers over BLE; DualSense and other gamepads use MFi (GameController).
+set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    SDL2
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-2.32.10
+    OVERRIDE_FIND_PACKAGE
+)
+FetchContent_MakeAvailable(SDL2)
+
+# With OBJCXX enabled (libultraship) the Ninja generator compiles SDL's .m
+# files as ObjC++ with -std=c++20, which clang rejects. Force Objective-C.
+get_target_property(sdl2_sources SDL2-static SOURCES)
+list(FILTER sdl2_sources INCLUDE REGEX "\\.m$")
+set_source_files_properties(${sdl2_sources} DIRECTORY ${sdl2_SOURCE_DIR} PROPERTIES LANGUAGE OBJC)
+
+#=================== nlohmann-json ===================
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.12.0
+    OVERRIDE_FIND_PACKAGE
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
+#=================== tinyxml2 ===================
+set(tinyxml2_BUILD_TESTING OFF)
+FetchContent_Declare(
+    tinyxml2
+    GIT_REPOSITORY https://github.com/leethomason/tinyxml2.git
+    GIT_TAG 11.0.0
+    OVERRIDE_FIND_PACKAGE
+)
+FetchContent_MakeAvailable(tinyxml2)
+
+#=================== spdlog ===================
+FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG v1.16.0
+    OVERRIDE_FIND_PACKAGE
+)
+FetchContent_MakeAvailable(spdlog)
+
+#=================== libzip ===================
+set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+set(BUILD_TOOLS OFF)
+set(BUILD_REGRESS OFF)
+set(BUILD_EXAMPLES OFF)
+set(BUILD_DOC OFF)
+set(BUILD_OSSFUZZ OFF)
+set(BUILD_SHARED_LIBS OFF)
+# CommonCrypto only; never pick up a host TLS library.
+set(ENABLE_OPENSSL OFF)
+set(ENABLE_GNUTLS OFF)
+set(ENABLE_MBEDTLS OFF)
+set(ENABLE_ZSTD OFF)
+FetchContent_Declare(
+    libzip
+    GIT_REPOSITORY https://github.com/nih-at/libzip.git
+    GIT_TAG v1.11.4
+    OVERRIDE_FIND_PACKAGE
+)
+FetchContent_MakeAvailable(libzip)
+list(APPEND ADDITIONAL_LIB_INCLUDES ${libzip_SOURCE_DIR}/lib ${libzip_BINARY_DIR})
+
+#=================== Metal-cpp ===================
+FetchContent_Declare(
+    metalcpp
+    GIT_REPOSITORY https://github.com/briaguya-ai/single-header-metal-cpp.git
+    GIT_TAG macOS13_iOS16
+)
+FetchContent_MakeAvailable(metalcpp)
+list(APPEND ADDITIONAL_LIB_INCLUDES ${metalcpp_SOURCE_DIR})
+
+#=================== ImGui ===================
+target_sources(ImGui
+    PRIVATE
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm
+)
+
+target_include_directories(ImGui PRIVATE ${metalcpp_SOURCE_DIR})
+target_compile_definitions(ImGui PUBLIC IMGUI_IMPL_METAL_CPP)
+
+# No SDL2main: the host app owns main().
+target_link_libraries(ImGui PUBLIC SDL2::SDL2-static)
