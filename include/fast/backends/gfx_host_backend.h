@@ -47,6 +47,10 @@ class GfxWindowBackendHost final : public GfxWindowBackend {
 
     // Current host presenter (ctx/present are null until the host sets one).
     static HPPresenter GetPresenter();
+    // Host drawable size in pixels (HP_SetViewSize). GetDimensions reports points,
+    // like the SDL backend on Apple platforms: pixels / GetContentScale().
+    static void GetDrawableSize(uint32_t* width, uint32_t* height);
+    static float GetContentScale();
 
   private:
     void SyncFramerateWithTime();

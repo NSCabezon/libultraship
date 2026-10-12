@@ -39,6 +39,9 @@
 #include "ship/config/ConsoleVariable.h"
 
 #include "fast/Fast3dWindow.h"
+#ifdef __VISIONOS__
+#include "fast/backends/gfx_host_backend.h"
+#endif
 
 #define ARRAY_COUNT(arr) (int32_t)(sizeof(arr) / sizeof(arr[0]))
 
@@ -80,6 +83,36 @@ bool GfxRenderingAPIMetal::MetalInit(SDL_Renderer* renderer) {
     mLayer->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
 
     mDevice = mLayer->device();
+
+    autorelease_pool->release();
+
+    return InitDeviceObjects();
+}
+
+#ifdef __VISIONOS__
+bool GfxRenderingAPIMetal::MetalInitHost() {
+    mHostMode = true;
+    mRenderer = nullptr;
+    mLayer = nullptr;
+    mCurrentDrawable = nullptr;
+
+    mDevice = MTL::CreateSystemDefaultDevice();
+    if (mDevice == nullptr) {
+        SPDLOG_ERROR("[HostMetal] MTLCreateSystemDefaultDevice returned nil");
+        return false;
+    }
+
+    const bool ok = InitDeviceObjects();
+    SPDLOG_INFO("[HostMetal] Metal init (host mode): device '{}', ImGui Metal renderer {}",
+                mDevice->name()->utf8String(), ok ? "ok" : "FAILED");
+    return ok;
+}
+#endif
+
+// Shared by the SDL and host init paths once mDevice is set.
+bool GfxRenderingAPIMetal::InitDeviceObjects() {
+    NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+
     mCommandQueue = mDevice->newCommandQueue();
     mReadbackQueue = mDevice->newCommandQueue();
 
@@ -98,7 +131,17 @@ static void SetupScreenFramebuffer(uint32_t width, uint32_t height);
 
 void GfxRenderingAPIMetal::NewFrame() {
     int width, height;
-    SDL_GetRendererOutputSize(mRenderer, &width, &height);
+#ifdef __VISIONOS__
+    if (mHostMode) {
+        uint32_t drawableWidth, drawableHeight;
+        GfxWindowBackendHost::GetDrawableSize(&drawableWidth, &drawableHeight);
+        width = (int)std::max(drawableWidth, 1U);
+        height = (int)std::max(drawableHeight, 1U);
+    } else
+#endif
+    {
+        SDL_GetRendererOutputSize(mRenderer, &width, &height);
+    }
     SetupScreenFramebuffer(width, height);
 
     MTL::RenderPassDescriptor* current_render_pass = mFramebuffers[0].mRenderPassDescriptor;
@@ -620,7 +663,13 @@ void GfxRenderingAPIMetal::EndFrame() {
         mScreenReadbackRequested = false;
     }
 
-    screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+    if (mHostMode) {
+        // Game and ImGui are composited into the output texture(s); the host encodes
+        // its presentation into the same command buffer before it is committed.
+        PresentHostOutputs(screen_framebuffer.mCommandBuffer);
+    } else {
+        screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+    }
     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
     screen_framebuffer.mCommandBuffer->commit();
 
@@ -688,9 +737,86 @@ int GfxRenderingAPIMetal::CreateFramebuffer() {
     return (int)index;
 }
 
+void GfxRenderingAPIMetal::GetScreenFramebufferSize(uint32_t* width, uint32_t* height) {
+    const TextureDataMetal& tex = mTextures[mFramebuffers[0].mTextureId];
+    *width = tex.width;
+    *height = tex.height;
+}
+
+// Host mode: (re)create the offscreen output texture of one eye at the host view size.
+void GfxRenderingAPIMetal::SetupHostOutputTexture(int eye, uint32_t width, uint32_t height) {
+    MTL::Texture*& output = mOutputTextures[eye];
+    if (output != nullptr && output->width() == width && output->height() == height) {
+        return;
+    }
+
+    MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
+    desc->setTextureType(MTL::TextureType2D);
+    desc->setWidth(width);
+    desc->setHeight(height);
+    desc->setMipmapLevelCount(1);
+    // Same format the CAMetalLayer drawable had, so ImGui and the readback path are unchanged.
+    desc->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    desc->setStorageMode(MTL::StorageModePrivate);
+    desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+
+    if (output != nullptr) {
+        output->release();
+    }
+    output = mDevice->newTexture(desc);
+    desc->release();
+
+    std::string label = fmt::format("Host Output Eye {}", eye);
+    output->setLabel(NS::String::string(label.c_str(), NS::UTF8StringEncoding));
+
+    SPDLOG_INFO("[HostMetal] output texture eye {} (re)created: {}x{} px BGRA8Unorm", eye, width, height);
+}
+
+void GfxRenderingAPIMetal::PresentHostOutputs(MTL::CommandBuffer* commandBuffer) {
+#ifdef __VISIONOS__
+    const HPPresenter presenter = GfxWindowBackendHost::GetPresenter();
+    // Only eye 0 is rendered until stereo lands; then this becomes the frame's eye count
+    // and each eye's composition writes mOutputTextures[eye] before this call.
+    const int eyeCount = 1;
+
+    if (presenter.present == nullptr) {
+        if (mHostFrameIndex == 0) {
+            SPDLOG_INFO("[HostMetal] no presenter installed; committing frames without presenting");
+        }
+    } else {
+        for (int eye = 0; eye < eyeCount; eye++) {
+            MTL::Texture* output = mOutputTextures[eye];
+            if (output == nullptr) {
+                continue;
+            }
+
+            HPPresentInfo info = {};
+            info.texture = output;
+            info.commandBuffer = commandBuffer;
+            info.eye = eye;
+            info.eyeCount = eyeCount;
+            info.frameIndex = mHostFrameIndex;
+            info.width = (int)output->width();
+            info.height = (int)output->height();
+            presenter.present(presenter.ctx, &info);
+
+            static bool sLoggedFirstPresent = false;
+            if (!sLoggedFirstPresent) {
+                sLoggedFirstPresent = true;
+                SPDLOG_INFO("[HostMetal] first present: frame {} eye {}/{} {}x{} px", info.frameIndex, eye, eyeCount,
+                            info.width, info.height);
+            }
+        }
+    }
+#endif
+    mHostFrameIndex++;
+}
+
 void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t height) {
     mCurrentDrawable = nullptr;
-    mCurrentDrawable = mLayer->nextDrawable();
+    if (!mHostMode) {
+        mCurrentDrawable = mLayer->nextDrawable();
+    }
 
     bool msaa_enabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gMSAAValue", 1) > 1;
 
@@ -699,7 +825,12 @@ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t heigh
 
     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
 
-    tex.texture = mCurrentDrawable->texture();
+    if (mHostMode) {
+        SetupHostOutputTexture(mCurrentEye, width, height);
+        tex.texture = mOutputTextures[mCurrentEye];
+    } else {
+        tex.texture = mCurrentDrawable->texture();
+    }
 
     MTL::RenderPassDescriptor* render_pass_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
     render_pass_descriptor->colorAttachments()->object(0)->setTexture(tex.texture);
@@ -752,6 +883,11 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
     // Screen framebuffer is handled separately on a frame by frame basis
     // see `SetupScreenFramebuffer`.
     if (fb_id == 0) {
+        // Host mode: the output texture follows the host view size in NewFrame.
+        if (mHostMode) {
+            return;
+        }
+
         int width, height;
         SDL_GetRendererOutputSize(mRenderer, &width, &height);
         mLayer->setDrawableSize({ CGFloat(width), CGFloat(height) });
@@ -973,7 +1109,7 @@ void GfxRenderingAPIMetal::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_so
 
     int target_texture_id = mFramebuffers[fb_id_target].mTextureId;
     MTL::Texture* target_texture =
-        target_texture_id == 0 ? mCurrentDrawable->texture() : mTextures[target_texture_id].texture;
+        (target_texture_id == 0 && !mHostMode) ? mCurrentDrawable->texture() : mTextures[target_texture_id].texture;
 
     // Workaround for detecting when transitioning to/from full screen mode.
     if (source_texture->width() != target_texture->width() || source_texture->height() != target_texture->height()) {

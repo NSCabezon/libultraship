@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include <SDL.h>
+#include <spdlog/spdlog.h>
 
 #include "fast/Fast3dWindow.h"
 #include "fast/Fast3dGui.h"
@@ -18,6 +19,12 @@
 #define _100NANOSECONDS_IN_SECOND 10000000
 
 namespace {
+// Points per pixel of the host drawable. The engine and ImGui work in points
+// (as with SDL on Apple platforms); gfx_metal renders framebuffer 0 in pixels.
+// 2.0 matches the visionOS window backing scale: a 2560x1440 drawable is a
+// 1280x720 pt window.
+constexpr float kHostContentScale = 2.0f;
+
 // Host state, written from the host (UI) thread and read on the game thread.
 std::atomic<uint32_t> sViewWidth{ 0 };
 std::atomic<uint32_t> sViewHeight{ 0 };
@@ -68,6 +75,20 @@ HPPresenter GfxWindowBackendHost::GetPresenter() {
     return sPresenter;
 }
 
+void GfxWindowBackendHost::GetDrawableSize(uint32_t* width, uint32_t* height) {
+    *width = sViewWidth;
+    *height = sViewHeight;
+}
+
+float GfxWindowBackendHost::GetContentScale() {
+    return kHostContentScale;
+}
+
+static uint32_t PixelsToPoints(uint32_t pixels) {
+    const uint32_t points = static_cast<uint32_t>(pixels / kHostContentScale);
+    return points > 0 ? points : 1;
+}
+
 void GfxWindowBackendHost::Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width,
                                 uint32_t height, int32_t posX, int32_t posY) {
     mFullScreen = false;
@@ -86,7 +107,10 @@ void GfxWindowBackendHost::Init(const char* gameName, const char* apiName, bool 
     // No video subsystem: SDL only provides events, audio and controllers.
     SDL_InitSubSystem(SDL_INIT_EVENTS);
 
-    // TODO(visionOS WP3/WP4): Metal device from the host and ImGui platform layer.
+    SPDLOG_INFO("[HostMetal] window backend init: drawable {}x{} px, scale {}, presenter {}", sViewWidth.load(),
+                sViewHeight.load(), kHostContentScale, GetPresenter().present != nullptr ? "set" : "not set");
+
+    // Fast3dGui creates the Metal device (MetalInitHost) and the ImGui platform layer.
     Fast::GuiWindowInitData windowImpl = {};
     windowImpl.Backend = WindowBackend::FAST3D_HOST_METAL;
     std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui())
@@ -155,8 +179,9 @@ bool GfxWindowBackendHost::IsMouseCaptured() {
 }
 
 void GfxWindowBackendHost::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
-    *width = sViewWidth;
-    *height = sViewHeight;
+    // Points, like SDL_GetWindowSize on Apple platforms (see GetDrawableSize for pixels).
+    *width = PixelsToPoints(sViewWidth);
+    *height = PixelsToPoints(sViewHeight);
     *posX = 0;
     *posY = 0;
 }
@@ -166,7 +191,7 @@ void GfxWindowBackendHost::SetDimensions(uint32_t width, uint32_t height, int32_
 }
 
 Ship::WindowRect GfxWindowBackendHost::GetPrimaryMonitorRect() {
-    return { 0, 0, static_cast<int32_t>(sViewWidth.load()), static_cast<int32_t>(sViewHeight.load()) };
+    return { 0, 0, static_cast<int32_t>(PixelsToPoints(sViewWidth)), static_cast<int32_t>(PixelsToPoints(sViewHeight)) };
 }
 
 void GfxWindowBackendHost::HandleEvents() {

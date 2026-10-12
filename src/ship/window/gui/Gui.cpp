@@ -78,6 +78,13 @@ void Gui::Init() {
 #if defined(__ANDROID__)
     ImGui::GetStyle().ScaleAllSizes(2.0f);
     mImGuiIo->FontGlobalScale = 2.0f;
+#elif defined(__VISIONOS__)
+    // No SDL video (SDL_GetDisplayUsableBounds fails). ImGui works in points of a
+    // ~1280x720 pt host window, viewed at a distance: 1.5 keeps the menu readable
+    // without crowding it (iPad uses 2.0 on a 1024x768 pt screen).
+    const float uiScale = 1.5f;
+    ImGui::GetStyle().ScaleAllSizes(uiScale);
+    mImGuiIo->FontGlobalScale = uiScale;
 #elif defined(__IOS__)
     SDL_Rect displayBounds = {};
     float uiScale = 1.0f;

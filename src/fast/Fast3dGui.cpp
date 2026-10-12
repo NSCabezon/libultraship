@@ -24,6 +24,14 @@
 #include "ship/port/mobile/MobileImpl.h"
 #endif
 
+#ifdef __VISIONOS__
+#include <SDL_gamecontroller.h>
+#include <SDL_timer.h>
+#include <spdlog/spdlog.h>
+#include <vector>
+#include "fast/backends/gfx_host_backend.h"
+#endif
+
 #ifdef ENABLE_OPENGL
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl2.h>
@@ -38,6 +46,143 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARA
 #endif
 
 namespace Fast {
+
+#ifdef __VISIONOS__
+// Minimal ImGui platform layer for FAST3D_HOST_METAL. imgui_impl_sdl2 needs SDL video,
+// which the visionOS build leaves out, so the display size comes from the host view and
+// the only input is gamepads, read over SDL_GameController (port of
+// ImGui_ImplSDL2_UpdateGamepads, AutoAll mode). Runs on the game thread.
+namespace {
+struct HostImGuiPlatform {
+    std::vector<SDL_GameController*> Gamepads;
+    bool WantUpdateGamepadsList = true;
+    int JoystickCount = -1;
+    uint64_t Time = 0;
+    ImVec2 LoggedDisplaySize = ImVec2(0.0f, 0.0f);
+};
+HostImGuiPlatform sHostPlatform;
+
+void HostCloseGamepads() {
+    // SDL_GameControllerOpen is reference counted: this does not close the ControlDeck's handles.
+    for (SDL_GameController* gamepad : sHostPlatform.Gamepads) {
+        SDL_GameControllerClose(gamepad);
+    }
+    sHostPlatform.Gamepads.clear();
+}
+
+void HostUpdateGamepadButton(ImGuiIO& io, ImGuiKey key, SDL_GameControllerButton button) {
+    bool merged = false;
+    for (SDL_GameController* gamepad : sHostPlatform.Gamepads) {
+        merged |= SDL_GameControllerGetButton(gamepad, button) != 0;
+    }
+    io.AddKeyEvent(key, merged);
+}
+
+void HostUpdateGamepadAnalog(ImGuiIO& io, ImGuiKey key, SDL_GameControllerAxis axis, float v0, float v1) {
+    float merged = 0.0f;
+    for (SDL_GameController* gamepad : sHostPlatform.Gamepads) {
+        float vn = ((float)SDL_GameControllerGetAxis(gamepad, axis) - v0) / (v1 - v0);
+        vn = vn < 0.0f ? 0.0f : (vn > 1.0f ? 1.0f : vn);
+        if (merged < vn) {
+            merged = vn;
+        }
+    }
+    io.AddKeyAnalogEvent(key, merged > 0.1f, merged);
+}
+
+void HostUpdateGamepads() {
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Re-enumerate when a controller comes or goes (SDL state is pumped in HandleEvents).
+    const int joystickCount = SDL_NumJoysticks();
+    if (joystickCount != sHostPlatform.JoystickCount) {
+        sHostPlatform.JoystickCount = joystickCount;
+        sHostPlatform.WantUpdateGamepadsList = true;
+    }
+    for (SDL_GameController* gamepad : sHostPlatform.Gamepads) {
+        if (!SDL_GameControllerGetAttached(gamepad)) {
+            sHostPlatform.WantUpdateGamepadsList = true;
+        }
+    }
+
+    if (sHostPlatform.WantUpdateGamepadsList) {
+        HostCloseGamepads();
+        for (int n = 0; n < joystickCount; n++) {
+            if (SDL_IsGameController(n)) {
+                if (SDL_GameController* gamepad = SDL_GameControllerOpen(n)) {
+                    sHostPlatform.Gamepads.push_back(gamepad);
+                    const char* name = SDL_GameControllerName(gamepad);
+                    SPDLOG_INFO("[HostImGui] gamepad bound for menu navigation: {}", name != nullptr ? name : "?");
+                }
+            }
+        }
+        SPDLOG_INFO("[HostImGui] {} gamepad(s) bound (Create/Share = SDL BACK toggles the menu)",
+                    sHostPlatform.Gamepads.size());
+        sHostPlatform.WantUpdateGamepadsList = false;
+    }
+
+    io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+    if (sHostPlatform.Gamepads.empty()) {
+        return;
+    }
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+
+    const float thumbDeadZone = 8000.0f; // SDL_gamecontroller.h suggests using this value.
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadStart, SDL_CONTROLLER_BUTTON_START);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadBack, SDL_CONTROLLER_BUTTON_BACK);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadFaceLeft, SDL_CONTROLLER_BUTTON_X);  // PS Square
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadFaceRight, SDL_CONTROLLER_BUTTON_B); // PS Circle
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadFaceUp, SDL_CONTROLLER_BUTTON_Y);    // PS Triangle
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadFaceDown, SDL_CONTROLLER_BUTTON_A);  // PS Cross
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadDpadLeft, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadDpadRight, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadDpadUp, SDL_CONTROLLER_BUTTON_DPAD_UP);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadDpadDown, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadL1, SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadR1, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadL2, SDL_CONTROLLER_AXIS_TRIGGERLEFT, 0.0f, 32767);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadR2, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 0.0f, 32767);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadL3, SDL_CONTROLLER_BUTTON_LEFTSTICK);
+    HostUpdateGamepadButton(io, ImGuiKey_GamepadR3, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadLStickLeft, SDL_CONTROLLER_AXIS_LEFTX, -thumbDeadZone, -32768);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadLStickRight, SDL_CONTROLLER_AXIS_LEFTX, +thumbDeadZone, +32767);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadLStickUp, SDL_CONTROLLER_AXIS_LEFTY, -thumbDeadZone, -32768);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadLStickDown, SDL_CONTROLLER_AXIS_LEFTY, +thumbDeadZone, +32767);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadRStickLeft, SDL_CONTROLLER_AXIS_RIGHTX, -thumbDeadZone, -32768);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadRStickRight, SDL_CONTROLLER_AXIS_RIGHTX, +thumbDeadZone, +32767);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadRStickUp, SDL_CONTROLLER_AXIS_RIGHTY, -thumbDeadZone, -32768);
+    HostUpdateGamepadAnalog(io, ImGuiKey_GamepadRStickDown, SDL_CONTROLLER_AXIS_RIGHTY, +thumbDeadZone, +32767);
+}
+
+// Call after GfxRenderingAPIMetal::NewFrame so the size matches framebuffer 0 exactly
+// (RenderDrawData skips ImGui when DisplaySize * FramebufferScale differs from it).
+void HostNewFrame(GfxRenderingAPIMetal* api) {
+    ImGuiIO& io = ImGui::GetIO();
+
+    uint32_t width, height;
+    api->GetScreenFramebufferSize(&width, &height);
+    const float scale = GfxWindowBackendHost::GetContentScale();
+    io.DisplaySize = ImVec2((float)width / scale, (float)height / scale);
+    io.DisplayFramebufferScale = ImVec2(scale, scale);
+    if (io.DisplaySize.x != sHostPlatform.LoggedDisplaySize.x ||
+        io.DisplaySize.y != sHostPlatform.LoggedDisplaySize.y) {
+        sHostPlatform.LoggedDisplaySize = io.DisplaySize;
+        SPDLOG_INFO("[HostImGui] display {}x{} pt, framebuffer scale {} ({}x{} px)", io.DisplaySize.x,
+                    io.DisplaySize.y, scale, width, height);
+    }
+
+    static const uint64_t sFrequency = SDL_GetPerformanceFrequency();
+    uint64_t now = SDL_GetPerformanceCounter();
+    if (now <= sHostPlatform.Time) {
+        now = sHostPlatform.Time + 1;
+    }
+    io.DeltaTime = sHostPlatform.Time > 0 ? (float)((double)(now - sHostPlatform.Time) / sFrequency) : 1.0f / 90.0f;
+    sHostPlatform.Time = now;
+
+    HostUpdateGamepads();
+}
+} // namespace
+#endif
 
 Fast3dGui::Fast3dGui() : Ship::Gui() {
 }
@@ -103,6 +248,13 @@ void Fast3dGui::ImGuiWMInit() {
             ImGui_ImplSDL2_InitForMetal(static_cast<SDL_Window*>(mImpl.Metal.Window));
             break;
 #endif
+#ifdef __VISIONOS__
+        case WindowBackend::FAST3D_HOST_METAL:
+            ImGui::GetIO().BackendPlatformName = "lus_host_visionos";
+            sHostPlatform.WantUpdateGamepadsList = true;
+            SPDLOG_INFO("[HostImGui] platform layer init (gamepad-only input)");
+            break;
+#endif
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
         case WindowBackend::FAST3D_DXGI_DX11:
             ImGui_ImplWin32_Init(mImpl.Dx11.Window);
@@ -126,6 +278,12 @@ void Fast3dGui::ImGuiWMShutdown() {
 #if __APPLE__
         case WindowBackend::FAST3D_SDL_METAL:
             ImGui_ImplSDL2_Shutdown();
+            break;
+#endif
+#ifdef __VISIONOS__
+        case WindowBackend::FAST3D_HOST_METAL:
+            HostCloseGamepads();
+            ImGui::GetIO().BackendPlatformName = nullptr;
             break;
 #endif
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
@@ -161,6 +319,13 @@ void Fast3dGui::ImGuiBackendInit() {
             break;
         }
 #endif
+#ifdef __VISIONOS__
+        case WindowBackend::FAST3D_HOST_METAL: {
+            GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
+            api->MetalInitHost();
+            break;
+        }
+#endif
 
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
@@ -182,6 +347,9 @@ void Fast3dGui::ImGuiBackendShutdown() {
 #endif
 #if __APPLE__
         case WindowBackend::FAST3D_SDL_METAL:
+#ifdef __VISIONOS__
+        case WindowBackend::FAST3D_HOST_METAL:
+#endif
             ImGui_ImplMetal_Shutdown();
             break;
 #endif
@@ -210,7 +378,11 @@ void Fast3dGui::ImGuiBackendNewFrame() {
 #endif
 
 #ifdef __APPLE__
-        case WindowBackend::FAST3D_SDL_METAL: {
+        case WindowBackend::FAST3D_SDL_METAL:
+#ifdef __VISIONOS__
+        case WindowBackend::FAST3D_HOST_METAL:
+#endif
+        {
             GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
             api->NewFrame();
             break;
@@ -227,6 +399,11 @@ void Fast3dGui::ImGuiWMNewFrame() {
         case WindowBackend::FAST3D_SDL_METAL:
             ImGui_ImplSDL2_NewFrame();
             break;
+#ifdef __VISIONOS__
+        case WindowBackend::FAST3D_HOST_METAL:
+            HostNewFrame((GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI());
+            break;
+#endif
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
             ImGui_ImplWin32_NewFrame();
@@ -240,6 +417,12 @@ void Fast3dGui::ImGuiWMNewFrame() {
 // Bind ImGui's SDL2 gamepad backend to the controller(s) the
 // ControlDeck has already opened
 void Fast3dGui::RefreshImGuiGamepads() {
+#ifdef __VISIONOS__
+    if (mImpl.Backend == WindowBackend::FAST3D_HOST_METAL) {
+        sHostPlatform.WantUpdateGamepadsList = true;
+        return;
+    }
+#endif
     if (mImpl.Backend != WindowBackend::FAST3D_SDL_OPENGL && mImpl.Backend != WindowBackend::FAST3D_SDL_METAL) {
         return;
     }
@@ -256,7 +439,11 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
 #endif
 
 #ifdef __APPLE__
-        case WindowBackend::FAST3D_SDL_METAL: {
+        case WindowBackend::FAST3D_SDL_METAL:
+#ifdef __VISIONOS__
+        case WindowBackend::FAST3D_HOST_METAL:
+#endif
+        {
             GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
             api->RenderDrawData(data);
             break;

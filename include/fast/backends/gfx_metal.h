@@ -16,6 +16,8 @@
 static constexpr size_t kMaxVertexBufferPoolSize = 3;
 static constexpr size_t METAL_MAX_MULTISAMPLE_SAMPLE_COUNT = 8;
 static constexpr size_t MAX_PIXEL_DEPTH_COORDS = 1024;
+// Host mode (visionOS): framebuffer 0 is one offscreen output texture per eye.
+static constexpr size_t METAL_MAX_OUTPUT_EYES = 2;
 
 namespace MTL {
 class Texture;
@@ -178,10 +180,21 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void SetupFloatingFrame();
     void RenderDrawData(ImDrawData* drawData);
     bool MetalInit(SDL_Renderer* renderer);
+#ifdef __VISIONOS__
+    // Host-driven init (FAST3D_HOST_METAL): own device and queue, no SDL renderer or
+    // CAMetalLayer. Framebuffer 0 renders into offscreen output textures that are
+    // handed to the gfx_host presenter at the end of each frame.
+    bool MetalInitHost();
+#endif
+    // Size in pixels of framebuffer 0 for the current frame (valid after NewFrame).
+    void GetScreenFramebufferSize(uint32_t* width, uint32_t* height);
 
   private:
     bool NonUniformThreadGroupSupported();
+    bool InitDeviceObjects();
     void SetupScreenFramebuffer(uint32_t width, uint32_t height);
+    void SetupHostOutputTexture(int eye, uint32_t width, uint32_t height);
+    void PresentHostOutputs(MTL::CommandBuffer* commandBuffer);
     // Elements that only need to be setup once
     SDL_Renderer* mRenderer;
     CA::MetalLayer* mLayer; // CA::MetalLayer*
@@ -236,6 +249,13 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
 
     bool mNonUniformThreadgroupSupported;
+
+    // Host mode: framebuffer 0 is mOutputTextures[eye] instead of a layer drawable.
+    // Only eye 0 is rendered while the eye count is 1.
+    bool mHostMode = false;
+    MTL::Texture* mOutputTextures[METAL_MAX_OUTPUT_EYES] = {};
+    int mCurrentEye = 0;
+    uint64_t mHostFrameIndex = 0;
 };
 
 } // namespace Fast
