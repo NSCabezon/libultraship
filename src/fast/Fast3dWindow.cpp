@@ -25,6 +25,9 @@
 #define CVAR_STEREO_ENABLED "gStereo.Enabled"         // 0 = both eyes see the mono image
 #define CVAR_STEREO_DEPTH "gStereo.Depth"             // 0-100 % of the divergence cap (default ~3% parallax)
 #define CVAR_STEREO_CONVERGENCE "gStereo.Convergence" // zero-disparity distance, game units (60-800)
+// 1 = the zero-disparity distance follows the game's focus hint (player distance); Convergence is the fallback.
+#define CVAR_STEREO_DYNAMIC_CONVERGENCE "gStereo.DynamicConvergence"
+#define CVAR_STEREO_CROSSED_LIMIT "gStereo.CrossedLimit" // max crossed disparity, % of Depth's parallax (0-400)
 
 namespace Fast {
 
@@ -278,12 +281,14 @@ StereoParams Fast3dWindow::GetStereoParams(int eyeCount) {
         maxParallax = std::min(0.063f / screenWidth, 0.1f);
     }
 #endif
-    const float depth = std::clamp(cvars->GetInteger(CVAR_STEREO_DEPTH, 67), 0, 100) / 100.0f;
+    const float depth = std::clamp(cvars->GetInteger(CVAR_STEREO_DEPTH, 30), 0, 100) / 100.0f;
 
     StereoParams params;
     params.eyeCount = eyeCount;
     params.parallax = cvars->GetInteger(CVAR_STEREO_ENABLED, 1) ? maxParallax * depth : 0.0f;
     params.convergence = (float)std::clamp(cvars->GetInteger(CVAR_STEREO_CONVERGENCE, 250), 60, 800);
+    params.dynamicConvergence = cvars->GetInteger(CVAR_STEREO_DYNAMIC_CONVERGENCE, 1) != 0;
+    params.crossedLimit = std::clamp(cvars->GetInteger(CVAR_STEREO_CROSSED_LIMIT, 100), 0, 400) / 100.0f;
     params.hudParallax = params.parallax * 0.3f;
     return params;
 }
@@ -321,8 +326,12 @@ std::chrono::steady_clock::duration Fast3dWindow::RunStereo(int eyeCount, Gfx* c
 }
 
 // Debug aid: with SOH_PERF_LOG set, logs the average CPU time of Interpreter::Run per frame
-// (all eyes) every 300 frames.
+// (all eyes) every 300 frames. On visionOS it always feeds HP_GetStats (host FPS meter).
 void Fast3dWindow::LogRunTime(std::chrono::steady_clock::duration runTime) {
+#ifdef __VISIONOS__
+    GfxWindowBackendHost::RecordFrameStats(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(runTime).count()));
+#endif
     static const bool sEnabled = getenv("SOH_PERF_LOG") != nullptr;
     if (!sEnabled) {
         return;

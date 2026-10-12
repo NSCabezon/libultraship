@@ -30,6 +30,7 @@
 #include <spdlog/spdlog.h>
 #include <vector>
 #include "fast/backends/gfx_host_backend.h"
+#include "ship/controller/physicaldevice/SenseControllers.h"
 #endif
 
 #ifdef ENABLE_OPENGL
@@ -57,6 +58,7 @@ struct HostImGuiPlatform {
     std::vector<SDL_GameController*> Gamepads;
     bool WantUpdateGamepadsList = true;
     int JoystickCount = -1;
+    bool NavForcedForModal = false;
     uint64_t Time = 0;
     ImVec2 LoggedDisplaySize = ImVec2(0.0f, 0.0f);
 };
@@ -90,10 +92,52 @@ void HostUpdateGamepadAnalog(ImGuiIO& io, ImGuiKey key, SDL_GameControllerAxis a
     io.AddKeyAnalogEvent(key, merged > 0.1f, merged);
 }
 
+// Binds controllers not bound yet and drops detached ones; handles still attached are kept.
+// Runs when SDL's joystick count changes (GCController connects asynchronously, also after
+// launch), when the ControlDeck reports a real add/remove (RefreshImGuiGamepads) or when a bound
+// handle detaches; never on a timer, so an unchanged set is never reopened.
+void HostRefreshGamepads() {
+    for (auto it = sHostPlatform.Gamepads.begin(); it != sHostPlatform.Gamepads.end();) {
+        if (SDL_GameControllerGetAttached(*it)) {
+            ++it;
+            continue;
+        }
+        SDL_GameControllerClose(*it);
+        it = sHostPlatform.Gamepads.erase(it);
+    }
+    for (int n = 0; n < SDL_NumJoysticks(); n++) {
+        if (!SDL_IsGameController(n) || Ship::SenseControllers::IsReplacedDevice(n)) {
+            continue;
+        }
+        const SDL_JoystickID instanceId = SDL_JoystickGetDeviceInstanceID(n);
+        bool bound = false;
+        for (SDL_GameController* gamepad : sHostPlatform.Gamepads) {
+            bound |= SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gamepad)) == instanceId;
+        }
+        if (bound) {
+            continue;
+        }
+        // Reference counted: shares the ControlDeck's handle for the same device.
+        if (SDL_GameController* gamepad = SDL_GameControllerOpen(n)) {
+            sHostPlatform.Gamepads.push_back(gamepad);
+            const char* name = SDL_GameControllerName(gamepad);
+            SPDLOG_INFO("[HostImGui] gamepad bound for menu navigation: {} (instance {})",
+                        name != nullptr ? name : "?", instanceId);
+        }
+    }
+    static size_t sLoggedGamepadCount = SIZE_MAX;
+    if (sHostPlatform.Gamepads.size() != sLoggedGamepadCount) {
+        sLoggedGamepadCount = sHostPlatform.Gamepads.size();
+        SPDLOG_INFO("[HostImGui] {} gamepad(s) bound (Create/Share = SDL BACK toggles the menu)",
+                    sLoggedGamepadCount);
+    }
+}
+
 void HostUpdateGamepads() {
     ImGuiIO& io = ImGui::GetIO();
 
-    // Re-enumerate when a controller comes or goes (SDL state is pumped in HandleEvents).
+    // Late connects and removals (SDL state is pumped in HandleEvents). Only bind/unbind the
+    // difference, see HostRefreshGamepads.
     const int joystickCount = SDL_NumJoysticks();
     if (joystickCount != sHostPlatform.JoystickCount) {
         sHostPlatform.JoystickCount = joystickCount;
@@ -104,26 +148,9 @@ void HostUpdateGamepads() {
             sHostPlatform.WantUpdateGamepadsList = true;
         }
     }
-
     if (sHostPlatform.WantUpdateGamepadsList) {
-        HostCloseGamepads();
-        for (int n = 0; n < joystickCount; n++) {
-            if (SDL_IsGameController(n)) {
-                if (SDL_GameController* gamepad = SDL_GameControllerOpen(n)) {
-                    sHostPlatform.Gamepads.push_back(gamepad);
-                    const char* name = SDL_GameControllerName(gamepad);
-                    SPDLOG_INFO("[HostImGui] gamepad bound for menu navigation: {}", name != nullptr ? name : "?");
-                }
-            }
-        }
-        // The list is refreshed periodically; only log when the bound set changes.
-        static size_t sLoggedGamepadCount = SIZE_MAX;
-        if (sHostPlatform.Gamepads.size() != sLoggedGamepadCount) {
-            sLoggedGamepadCount = sHostPlatform.Gamepads.size();
-            SPDLOG_INFO("[HostImGui] {} gamepad(s) bound (Create/Share = SDL BACK toggles the menu)",
-                        sLoggedGamepadCount);
-        }
         sHostPlatform.WantUpdateGamepadsList = false;
+        HostRefreshGamepads();
     }
 
     io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
@@ -407,6 +434,19 @@ void Fast3dGui::ImGuiWMNewFrame() {
 #ifdef __VISIONOS__
         case WindowBackend::FAST3D_HOST_METAL:
             HostNewFrame((GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI());
+            // LUS enables gamepad navigation only while the menu is open, but SoH's modals (e.g. the
+            // first-run "Run Ship of Harkinian" prompt) also show with it closed. The headset has
+            // no other input, so keep navigation on while a modal is open, then restore LUS's rule.
+            if (ImGui::GetTopMostPopupModal() != nullptr) {
+                if (!GamepadNavigationEnabled()) {
+                    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+                    sHostPlatform.NavForcedForModal = true;
+                }
+            } else if (sHostPlatform.NavForcedForModal) {
+                sHostPlatform.NavForcedForModal = false;
+                BlockGamepadNavigation();
+                UnblockGamepadNavigation();
+            }
             break;
 #endif
 #ifdef ENABLE_DX11

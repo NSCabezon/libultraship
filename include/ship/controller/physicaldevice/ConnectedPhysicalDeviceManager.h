@@ -26,7 +26,8 @@ class ConnectedPhysicalDeviceManager {
     void HandlePhysicalDeviceConnect(int32_t sdlDeviceIndex);
     void HandlePhysicalDeviceDisconnect(int32_t sdlJoystickInstanceId);
     void HandlePhysicalDeviceRemap(int32_t sdlJoystickInstanceId);
-    void RefreshConnectedSDLGamepads(const char* reason);
+    // Both return true only when a controller handle was opened or closed.
+    bool RefreshConnectedSDLGamepads(const char* reason);
     bool ReconcileIfNeeded(const char* reason);
 
   private:

@@ -74,6 +74,12 @@ constexpr int8_t RDP_G_SETTARGETINTERPINDEX = OPCODE(0x46);
 constexpr int8_t RDP_G_LOADBLOCK_WIDE = OPCODE(0x47);
 constexpr int8_t RDP_G_VTX_WIDE = OPCODE(0x48);
 constexpr int8_t RDP_G_TRI1_WIDE = OPCODE(0x49);
+constexpr int8_t OTR_G_SETSTEREO = OPCODE(0x4a);
+// G_SETSTEREO operations (G_STEREO_* in gbi.h)
+constexpr uint8_t OTR_G_STEREO_PROJ_HUD = 1;
+constexpr uint8_t OTR_G_STEREO_SKY_BEGIN = 2;
+constexpr uint8_t OTR_G_STEREO_SKY_END = 3;
+constexpr uint8_t OTR_G_STEREO_CONVERGENCE = 4;
 
 /*
  * The following commands are the "generated" RDP commands; the user

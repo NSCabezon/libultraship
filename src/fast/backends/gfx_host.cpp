@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include <SDL.h>
@@ -17,6 +19,8 @@
 #include "fast/Fast3dGui.h"
 #include "ship/Context.h"
 #include "ship/config/Config.h"
+#include "ship/audio/Audio.h"
+#include "ship/audio/SDLAudioPlayer.h"
 
 #define _100NANOSECONDS_IN_SECOND 10000000
 
@@ -34,6 +38,17 @@ std::atomic<bool> sActive{ true };
 std::atomic<int> sEyeCount{ 1 };
 std::atomic<float> sScreenWidthMeters{ 0.0f };
 std::atomic<float> sScreenDistanceMeters{ 0.0f };
+// Frame stats (HP_GetStats), written by the game thread.
+std::atomic<uint64_t> sStatFrames{ 0 };
+std::atomic<uint64_t> sStatRunTimeNs{ 0 };
+std::atomic<uint64_t> sStatRunTimeMaxNs{ 0 };
+std::atomic<int> sStatEyeCount{ 1 };
+// Display clock (HP_DisplayTick).
+std::atomic<uint64_t> sDisplayTicks{ 0 };
+std::atomic<double> sDisplayHz{ 90.0 };
+std::atomic<int64_t> sDisplayTickTimeNs{ 0 }; // steady_clock time of the last tick
+std::mutex sTickMutex;
+std::condition_variable sTickCondition;
 std::mutex sStateMutex;
 std::condition_variable sActiveCondition;
 HPPresenter sPresenter = { nullptr, nullptr };
@@ -69,7 +84,71 @@ extern "C" void HP_SetScreenGeometry(float widthMeters, float distanceMeters) {
     sScreenDistanceMeters = distanceMeters;
 }
 
+static int64_t SteadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+extern "C" void HP_DisplayTick(double refreshHz) {
+    // The rate the link reports is not always the rate it fires at (the simulator
+    // reports 90 Hz and ticks at ~60), so measure it and snap to a standard rate.
+    static double sMeasuredHz = 0.0; // main thread only
+    const int64_t now = SteadyNowNs();
+    const int64_t interval = now - sDisplayTickTimeNs.load(std::memory_order_relaxed);
+    if (interval > 2000000 && interval < 50000000) {
+        const double hz = 1e9 / static_cast<double>(interval);
+        sMeasuredHz = sMeasuredHz > 0.0 ? sMeasuredHz * 0.95 + hz * 0.05 : hz;
+    } else if (sMeasuredHz <= 0.0 && refreshHz >= 20.0 && refreshHz <= 240.0) {
+        sMeasuredHz = refreshHz;
+    }
+    if (sMeasuredHz > 0.0) {
+        static const double kRates[] = { 30.0, 45.0, 60.0, 72.0, 90.0, 96.0, 100.0, 120.0 };
+        double best = kRates[0];
+        for (double rate : kRates) {
+            if (std::abs(rate - sMeasuredHz) < std::abs(best - sMeasuredHz)) {
+                best = rate;
+            }
+        }
+        sDisplayHz.store(best, std::memory_order_relaxed);
+    }
+    sDisplayTickTimeNs.store(now, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(sTickMutex);
+        sDisplayTicks.fetch_add(1, std::memory_order_release);
+    }
+    sTickCondition.notify_all();
+}
+
+extern "C" void HP_GetStats(HPStats* out) {
+    if (out == nullptr) {
+        return;
+    }
+    HPStats stats = {};
+    stats.size = static_cast<uint32_t>(std::min<size_t>(out->size, sizeof(HPStats)));
+    stats.eyeCount = sStatEyeCount.load(std::memory_order_relaxed);
+    stats.frames = sStatFrames.load(std::memory_order_acquire);
+    stats.runTimeNs = sStatRunTimeNs.load(std::memory_order_relaxed);
+    stats.runTimeMaxNs = sStatRunTimeMaxNs.exchange(0, std::memory_order_relaxed);
+    stats.width = static_cast<int>(sViewWidth.load());
+    stats.height = static_cast<int>(sViewHeight.load());
+    stats.audioUnderruns = Ship::SDLAudioPlayer::GetUnderrunCount();
+    auto context = Ship::Context::GetRawInstance();
+    auto audio = context != nullptr ? context->GetAudio() : nullptr;
+    auto player = audio != nullptr ? audio->GetAudioPlayer() : nullptr;
+    stats.audioQueuedFrames = player != nullptr && player->IsInitialized() ? player->Buffered() : 0;
+    memcpy(out, &stats, stats.size);
+}
+
 namespace Fast {
+
+void GfxWindowBackendHost::RecordFrameStats(uint64_t runTimeNs) {
+    sStatRunTimeNs.fetch_add(runTimeNs, std::memory_order_relaxed);
+    uint64_t max = sStatRunTimeMaxNs.load(std::memory_order_relaxed);
+    while (runTimeNs > max && !sStatRunTimeMaxNs.compare_exchange_weak(max, runTimeNs, std::memory_order_relaxed)) {
+    }
+    sStatEyeCount.store(GetEyeCount(), std::memory_order_relaxed);
+    sStatFrames.fetch_add(1, std::memory_order_release);
+}
 
 HPPresenter GfxWindowBackendHost::GetPresenter() {
     std::lock_guard<std::mutex> lock(sStateMutex);
@@ -271,8 +350,29 @@ void GfxWindowBackendHost::SyncFramerateWithTime() {
     mPreviousTime = t;
 }
 
+// Paces on the host's display ticks: one frame every refreshHz / targetFps ticks (a
+// fraction, e.g. 4.5 at 20 fps on 90 Hz, alternates 4 and 5). A late frame does not
+// try to catch up. Returns false while no ticks arrive (no host clock): use the timer.
+bool GfxWindowBackendHost::SyncFramerateWithDisplay() {
+    constexpr int64_t kStaleNs = 100 * 1000 * 1000;
+    if (SteadyNowNs() - sDisplayTickTimeNs.load(std::memory_order_relaxed) > kStaleNs) {
+        mDueTick = 0.0;
+        return false;
+    }
+    const double ticksPerFrame = std::max(1.0, sDisplayHz.load(std::memory_order_relaxed) / std::max(1u, mTargetFps));
+    const double now = static_cast<double>(sDisplayTicks.load(std::memory_order_acquire));
+    mDueTick = (mDueTick <= 0.0 || mDueTick + ticksPerFrame < now) ? now + 1.0 : mDueTick + ticksPerFrame;
+    const uint64_t due = static_cast<uint64_t>(mDueTick + 0.5 - 1e-6);
+    std::unique_lock<std::mutex> lock(sTickMutex);
+    sTickCondition.wait_for(lock, std::chrono::milliseconds(100),
+                            [due] { return sDisplayTicks.load(std::memory_order_acquire) >= due; });
+    return true;
+}
+
 void GfxWindowBackendHost::SwapBuffersBegin() {
-    SyncFramerateWithTime();
+    if (!SyncFramerateWithDisplay()) {
+        SyncFramerateWithTime();
+    }
 }
 
 void GfxWindowBackendHost::SwapBuffersEnd() {

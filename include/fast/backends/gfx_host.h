@@ -52,6 +52,31 @@ void HP_SetEyeCount(int count);
 /* Virtual screen width and distance from the viewer, in meters. */
 void HP_SetScreenGeometry(float widthMeters, float distanceMeters);
 
+/* Display clock: the host calls this on every display refresh (CADisplayLink, main
+ * thread) with the nominal display rate in Hz (a hint: the engine measures the tick
+ * rate and snaps it to a standard one). While ticks arrive the engine starts each frame
+ * on a tick, every rate/targetFps ticks (2 for 45 fps on a 90 Hz panel), instead of
+ * using its own timer; without ticks for 100 ms it falls back to the timer. */
+void HP_DisplayTick(double refreshHz);
+
+/* Engine counters for the host's FPS meter and perf reports. Grows by appending
+ * fields only: the host sets `size` to sizeof(HPStats) as it was compiled and the
+ * engine fills at most that many bytes (and writes back the size it filled). */
+typedef struct HPStats {
+    uint32_t size;         /* in: sizeof(HPStats) on the host; out: bytes filled */
+    int eyeCount;          /* eyes rendered by the last frame */
+    uint64_t frames;       /* frames run by the interpreter (monotonic) */
+    uint64_t runTimeNs;    /* CPU time in Interpreter::Run, all eyes, summed over `frames` (monotonic) */
+    uint64_t runTimeMaxNs; /* longest frame since the previous HP_GetStats call (the call resets it) */
+    int width, height;     /* engine render size in pixels (HP_SetViewSize) */
+    uint64_t audioUnderruns; /* times the audio queue ran dry (SDL backend; monotonic) */
+    int audioQueuedFrames;   /* audio frames queued in the SDL device right now */
+} HPStats;
+
+/* Snapshot of the engine counters. Lock-free; meant for a single polling consumer
+ * (runTimeMaxNs is reset on each call). */
+void HP_GetStats(HPStats* out);
+
 #ifdef __cplusplus
 }
 #endif

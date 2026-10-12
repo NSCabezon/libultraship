@@ -196,6 +196,19 @@
 #define G_POP_SHADER 0x44
 #define G_SETTILESIZE_INTERP 0x45
 #define G_SETTARGETINTERPINDEX 0x46
+#define G_SETSTEREO 0x4a
+
+/*
+ * Stereo hints (visionOS per-eye rendering, see docs/visionos-stereo-design.md). No-ops in mono.
+ *  G_STEREO_PROJ_HUD:    the next projection load is interface (constant crossed disparity), not world.
+ *  G_STEREO_SKY_BEGIN/END: geometry in between is at infinity (no eye translation, only the convergence shear).
+ *  G_STEREO_CONVERGENCE: zero-disparity distance in game units (16.16 fixed point), smoothed by the renderer;
+ *                        flags = 1 snaps to it (camera cut).
+ */
+#define G_STEREO_PROJ_HUD 1
+#define G_STEREO_SKY_BEGIN 2
+#define G_STEREO_SKY_END 3
+#define G_STEREO_CONVERGENCE 4
 
 /*
  * The following commands are the "generated" RDP commands; the user
@@ -2828,6 +2841,18 @@ typedef union Gfx {
 
 #define gsSPGrayscale(state) \
     { (_SHIFTL(G_SETGRAYSCALE, 24, 8)), (state) }
+
+#define gSPStereo(pkt, op, flags, value)                                                   \
+    {                                                                                      \
+        Gfx* _g = (Gfx*)(pkt);                                                             \
+                                                                                           \
+        _g->words.w0 = _SHIFTL(G_SETSTEREO, 24, 8) | _SHIFTL(op, 16, 8) | _SHIFTL(flags, 0, 16); \
+        _g->words.w1 = (unsigned int)(value);                                              \
+    }
+
+#define gSPStereoMode(pkt, op) gSPStereo(pkt, op, 0, 0)
+#define gSPStereoConvergence(pkt, dist, cut) \
+    gSPStereo(pkt, G_STEREO_CONVERGENCE, (cut) ? 1 : 0, (unsigned int)((dist) * 65536.0f))
 
 #define gsSPPushShader(shader)                                  \
     { (_SHIFTL(G_PUSH_SHADER, 24, 8)), (uintptr_t)(shader) }, { \

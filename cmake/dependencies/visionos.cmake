@@ -36,6 +36,11 @@ set_source_files_properties(${sdl2_sources} DIRECTORY ${sdl2_SOURCE_DIR} PROPERT
 # SDL_IsTablet() still references SDL_IsIPad() from the compiled-out UIKit video backend.
 target_sources(SDL2-static PRIVATE ${CMAKE_CURRENT_LIST_DIR}/visionos-sdl-stubs.c)
 
+# The PS VR2 Sense pair is merged into one virtual game controller (LUS SenseControllers.mm).
+# SDL's CMake only offers the virtual joystick driver together with HIDAPI, which is off above.
+target_sources(SDL2-static PRIVATE ${sdl2_SOURCE_DIR}/src/joystick/virtual/SDL_virtualjoystick.c)
+target_compile_definitions(SDL2-static PRIVATE SDL_JOYSTICK_VIRTUAL=1)
+
 #=================== nlohmann-json ===================
 FetchContent_Declare(
     nlohmann_json

@@ -4,6 +4,9 @@
 #include "ship/controller/controldeck/ControlDeck.h"
 #include "ship/window/Window.h"
 #include "ship/window/gui/Gui.h"
+#ifdef __VISIONOS__
+#include "ship/controller/physicaldevice/SenseControllers.h"
+#endif
 
 namespace Ship {
 
@@ -17,6 +20,10 @@ void SDLAddRemoveDeviceEventHandler::DrawElement() {
 }
 
 void SDLAddRemoveDeviceEventHandler::UpdateElement() {
+#ifdef __VISIONOS__
+    // Attaching/detaching the merged Sense controller queues the add/remove events read below.
+    SenseControllers::Update();
+#endif
     SDL_PumpEvents();
     SDL_Event event;
     bool changed = false;

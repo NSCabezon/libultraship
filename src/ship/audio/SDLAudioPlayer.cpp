@@ -3,6 +3,12 @@
 
 namespace Ship {
 
+static std::atomic<uint64_t> sUnderruns{ 0 };
+
+uint64_t SDLAudioPlayer::GetUnderrunCount() {
+    return sUnderruns.load(std::memory_order_relaxed);
+}
+
 SDLAudioPlayer::~SDLAudioPlayer() {
     SPDLOG_TRACE("destruct SDL audio player");
     DoClose();
@@ -58,6 +64,7 @@ int SDLAudioPlayer::Buffered() {
 
 void SDLAudioPlayer::SetPaused(bool paused) {
     mPaused = paused;
+    mStarted = false;
     if (mDevice == 0) {
         return;
     }
@@ -68,7 +75,15 @@ void SDLAudioPlayer::SetPaused(bool paused) {
 }
 
 void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
-    if (!mPaused && Buffered() < 6000) {
+    if (mPaused) {
+        return;
+    }
+    const int buffered = Buffered();
+    if (buffered == 0 && mStarted) {
+        sUnderruns.fetch_add(1, std::memory_order_relaxed);
+    }
+    mStarted = true;
+    if (buffered < 6000) {
         // Don't fill the audio buffer too much in case this happens
         SDL_QueueAudio(mDevice, buf, len);
     }

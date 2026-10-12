@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <chrono>
 #include <any>
 #include <map>
 #include <set>
@@ -1501,28 +1502,120 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
 //    convergence distance D has zero disparity (off-axis, no toe-in). Per vertex x' = x - h·P00 + k·w;
 //    y, z and w are unchanged, so depth, fog and clipping stay as in mono.
 //  - Orthographic (HUD): constant horizontal offset (crossed disparity, the HUD floats in front).
+//  - Perspective tagged as interface (G_STEREO_PROJ_HUD): the same HUD disparity, as a shear (x += k·w).
+// Since every later projection MUL is affine, the eye terms stay "clip x += C + k·w" with C in [3][0];
+// sky mode (SetStereoSky) removes C so the skybox sits at infinity.
 void Interpreter::ApplyStereoProjection(float matrix[4][4]) {
     const float sigma = mEye == 0 ? -1.0f : 1.0f;
     // AdjXForAspectRatio scales clip x later; divide it out so disparities are fractions of the image.
     const float aspectAdj = AdjXForAspectRatio(1.0f);
+    const bool hud = mStereoNextProjHud;
+    mStereoNextProjHud = false;
+    mStereoProjPerspective = false;
+    mStereoProjC = 0.0f;
+    mStereoProjK = 0.0f;
+    mStereoProjWorld = false;
 
     if (fabsf(matrix[3][3]) < 1e-6f && matrix[2][3] < -1e-6f) {
+        mStereoProjPerspective = true;
+        if (hud) {
+            mStereoProjK = StereoHudOffset() / aspectAdj;
+            for (int i = 0; i < 4; i++) {
+                matrix[i][0] += mStereoProjK * matrix[i][3];
+            }
+            if (mStereoSky) {
+                ApplyStereoSkyTerms(matrix, 1.0f);
+            }
+            return;
+        }
         const float wScale = -matrix[2][3]; // guPerspective scale: w = wScale·distance
         const float focal = matrix[0][0] / wScale;
         if (fabsf(focal) < 1e-6f) {
             return;
         }
         // Parallax p at infinity per eye (NDC) gives k; zero disparity at D gives h.
+        const float convergence =
+            mConvergenceTagged && mStereo.dynamicConvergence ? mConvergenceSmoothed : mStereo.convergence;
         const float k = sigma * mStereo.parallax / aspectAdj;
-        const float h = k * mStereo.convergence / focal;
+        const float h = k * convergence / focal;
+        mStereoProjC = -h * matrix[0][0];
+        mStereoProjK = k;
+        mStereoProjWorld = true;
         for (int j = 0; j < 4; j++) {
             matrix[3][j] -= h * matrix[0][j];
         }
         for (int i = 0; i < 4; i++) {
             matrix[i][0] += k * matrix[i][3];
         }
+        if (mStereoSky) {
+            ApplyStereoSkyTerms(matrix, 1.0f);
+        }
     } else if (fabsf(matrix[2][3]) < 1e-6f && fabsf(matrix[3][3]) > 1e-6f) {
         matrix[3][0] += StereoHudOffset() / aspectAdj * matrix[3][3];
+    }
+}
+
+// Sky mode: geometry drawn around the camera (skybox, sun, moon) gets the disparity of infinity:
+// the eye terms C + K·w of the current perspective become 0 + kInf·w (no eye translation, only the
+// world convergence shear). sign = 1 enters sky mode, -1 leaves it.
+void Interpreter::ApplyStereoSkyTerms(float matrix[4][4], float sign) {
+    if (!mStereoProjPerspective) {
+        return;
+    }
+    const float kInf = (mEye == 0 ? -1.0f : 1.0f) * mStereo.parallax / AdjXForAspectRatio(1.0f);
+    const float dk = sign * (kInf - mStereoProjK);
+    for (int i = 0; i < 4; i++) {
+        matrix[i][0] += dk * matrix[i][3];
+    }
+    matrix[3][0] -= sign * mStereoProjC;
+}
+
+void Interpreter::SetStereoSky(bool sky) {
+    if (sky == mStereoSky) {
+        return;
+    }
+    mStereoSky = sky;
+    ApplyStereoSkyTerms(mRsp->P_matrix, sky ? 1.0f : -1.0f);
+    if (mRsp->modelview_matrix_stack_size > 0) {
+        MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
+                  mRsp->P_matrix);
+    }
+}
+
+// G_SETSTEREO: stereo hints from the game. Ignored in mono, so mono output is unchanged.
+void Interpreter::GfxSpStereo(uint32_t op, uint32_t flags, uint32_t value) {
+    if (mStereo.eyeCount <= 1) {
+        return;
+    }
+    switch (op) {
+        case OTR_G_STEREO_PROJ_HUD:
+            mStereoNextProjHud = true;
+            break;
+        case OTR_G_STEREO_SKY_BEGIN:
+        case OTR_G_STEREO_SKY_END:
+            SetStereoSky(op == OTR_G_STEREO_SKY_BEGIN);
+            break;
+        case OTR_G_STEREO_CONVERGENCE: {
+            // Distance to the player's focus, clamped and smoothed (~0.3 s to settle); snaps on camera cuts
+            // and when hints resume after a pause. Only eye 0 advances it, so both eyes use the same value.
+            const float target = std::clamp(value / 65536.0f, 60.0f, 800.0f);
+            mConvergenceTagged = true;
+            if (mEye != 0) {
+                break;
+            }
+            const double now =
+                std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            const double dt = now - mConvergenceTime;
+            if ((flags & 1) || dt > 0.5 || mConvergenceSmoothed <= 0.0f) {
+                mConvergenceSmoothed = target;
+            } else {
+                mConvergenceSmoothed += (target - mConvergenceSmoothed) * (float)(1.0 - exp(-dt / 0.1));
+            }
+            mConvergenceTime = now;
+            break;
+        }
+        default:
+            break;
     }
 }
 
@@ -1589,6 +1682,16 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
+        }
+
+        // Stereo: cap the crossed disparity of very near world geometry (per-eye NDC disparity is
+        // k + C/w; for distances below D it has the opposite sign of k and grows as 1/w).
+        if (mStereoProjWorld && !mStereoSky && w > 0.0f) {
+            const float disparity = mStereoProjK + mStereoProjC / w;
+            const float limit = -mStereo.crossedLimit * mStereoProjK;
+            if ((mStereoProjK > 0.0f && disparity < limit) || (mStereoProjK < 0.0f && disparity > limit)) {
+                x += (limit - disparity) * w;
+            }
         }
 
         x = AdjXForAspectRatio(x);
@@ -4578,6 +4681,14 @@ bool gfx_obj_rectangle_handler_s2dex(F3DGfx** cmd0) {
     return false;
 }
 
+bool gfx_set_stereo_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *(cmd0);
+
+    gfx->GfxSpStereo(C0(16, 8), C0(0, 16), (uint32_t)cmd->words.w1);
+    return false;
+}
+
 bool gfx_extra_geometry_mode_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *(cmd0);
@@ -4688,6 +4799,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
+    { OTR_G_SETSTEREO, { "G_SETSTEREO", gfx_set_stereo_handler_custom } }, // G_SETSTEREO (0x4a)
     { RDP_G_LOADBLOCK_WIDE, { "G_LOADBLOCK_WIDE", gfx_load_block_wide_handler_rdp } }, // RDP_G_LOADBLOCK_WIDE (-15)
     { RDP_G_VTX_WIDE, { "G_VTX_WIDE", gfx_vtx_handler_f3dex2 } },                      // RDP_G_VTX_WIDE (-16)
     { RDP_G_TRI1_WIDE, { "G_TRI1_WIDE", gfx_tri1_handler_f3dex2 } },                   // RDP_G_TRI1_WIDE (-17)
@@ -5159,6 +5271,14 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mGetPixelDepthCached.clear();
 
     mCurMtxReplacements = &mtx_replacements;
+
+    mStereoNextProjHud = false;
+    mStereoSky = false;
+    mStereoProjPerspective = false;
+    mStereoProjC = 0.0f;
+    mStereoProjK = 0.0f;
+    mStereoProjWorld = false;
+    mConvergenceTagged = false;
 
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);

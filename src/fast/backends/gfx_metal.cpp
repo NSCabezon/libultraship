@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <queue>
 #include <time.h>
+#include <chrono>
+#include <cstdlib>
 #include <math.h>
 #include <cmath>
 #include <stddef.h>
@@ -263,6 +265,7 @@ void GfxRenderingAPIMetal::ClearShaderCache() {
 }
 
 struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+    const auto compileStart = std::chrono::steady_clock::now();
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
@@ -347,6 +350,13 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
     pipeline_descriptor->release();
     autorelease_pool->release();
 
+    // SOH_PERF_LOG: shaders are compiled from source on first use, on the game thread (frame hitches).
+    static const bool sPerfLog = getenv("SOH_PERF_LOG") != nullptr;
+    if (sPerfLog) {
+        SPDLOG_INFO("[Perf] shader {:016x}/{:016x} compiled in {:.1f} ms ({} total)", shader_id0, shader_id1,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart).count(),
+                    mShaderProgramPool.size());
+    }
     return (struct ShaderProgram*)prg;
 }
 

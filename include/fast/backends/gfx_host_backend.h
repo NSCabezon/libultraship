@@ -56,11 +56,16 @@ class GfxWindowBackendHost final : public GfxWindowBackend {
     static int GetEyeCount();
     // Virtual screen geometry in meters (HP_SetScreenGeometry); zero while unknown.
     static void GetScreenGeometry(float* widthMeters, float* distanceMeters);
+    // Feeds HP_GetStats: one call per frame with its Interpreter::Run CPU time (all eyes).
+    // Lock-free and allocation-free.
+    static void RecordFrameStats(uint64_t runTimeNs);
 
   private:
     void SyncFramerateWithTime();
+    bool SyncFramerateWithDisplay();
 
     uint64_t mPreviousTime = 0;
+    double mDueTick = 0.0; // display tick the next frame waits for (HP_DisplayTick pacing)
     void (*mOnAllKeysUp)() = nullptr;
 };
 } // namespace Fast

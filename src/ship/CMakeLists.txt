@@ -24,6 +24,10 @@ target_sources(libultraship PRIVATE ${Source_Files__Audio})
 
 file(GLOB_RECURSE Source_Files__Controller RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "controller/*.cpp")
 
+if (CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+    list(APPEND Source_Files__Controller ${CMAKE_CURRENT_SOURCE_DIR}/controller/physicaldevice/SenseControllers.mm)
+endif()
+
 source_group("controller" FILES ${Source_Files__Controller})
 target_sources(libultraship PRIVATE ${Source_Files__Controller})
 

@@ -33,6 +33,9 @@ class SDLAudioPlayer final : public AudioPlayer {
     /** @brief Pauses/resumes the SDL device and drops audio queued before a pause. */
     void SetPaused(bool paused) override;
 
+    /** @brief Times new audio arrived to an empty queue (the device played silence), process-wide. */
+    static uint64_t GetUnderrunCount();
+
   protected:
     /**
      * @brief Opens the SDL audio device with the configured settings.
@@ -56,5 +59,6 @@ class SDLAudioPlayer final : public AudioPlayer {
     SDL_AudioDeviceID mDevice = 0; ///< Handle to the opened SDL audio device.
     int32_t mNumChannels = 2;      ///< Number of output channels (2 for stereo, 6 for 5.1).
     std::atomic<bool> mPaused = false;
+    bool mStarted = false; ///< Something was queued since open/unpause (underrun accounting).
 };
 } // namespace Ship

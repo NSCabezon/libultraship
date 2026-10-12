@@ -1,4 +1,7 @@
 #include "ship/controller/physicaldevice/ConnectedPhysicalDeviceManager.h"
+#ifdef __VISIONOS__
+#include "ship/controller/physicaldevice/SenseControllers.h"
+#endif
 
 #include <utility>
 #include <vector>
@@ -109,7 +112,7 @@ void ConnectedPhysicalDeviceManager::CloseGamepad(int32_t instanceId, const SDLG
     }
 }
 
-void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads(const char* reason) {
+bool ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads(const char* reason) {
     if (std::string_view(reason) != "active-check") {
         SPDLOG_INFO("Reconciling controllers: {}", reason);
     }
@@ -117,6 +120,7 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads(const char* rea
     std::unordered_map<int32_t, SDLGamepadRecord> nextGamepads;
     std::vector<ControllerSlotAssignments::Device> discoveredDevices;
     static SDL_JoystickGUID sZeroGuid;
+    bool changed = false;
 
     for (int32_t deviceIndex = 0; deviceIndex < SDL_NumJoysticks(); ++deviceIndex) {
         SDL_JoystickGUID deviceGuid = SDL_JoystickGetDeviceGUID(deviceIndex);
@@ -131,6 +135,11 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads(const char* rea
             SPDLOG_WARN("SDL joystick device index {} (GUID {}) is not a mapped game controller", deviceIndex, guid);
             continue;
         }
+#ifdef __VISIONOS__
+        if (SenseControllers::IsReplacedDevice(deviceIndex)) {
+            continue; // read through the merged virtual controller instead
+        }
+#endif
 
         int32_t instanceId = SDL_JoystickGetDeviceInstanceID(deviceIndex);
         if (instanceId < 0) {
@@ -173,6 +182,7 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads(const char* rea
             continue;
         }
         discoveredDevices.push_back({ openedInstanceId, inserted->second.stableId });
+        changed = true;
         SPDLOG_INFO("Opened controller device index {} as instance {} ({}) during {}", deviceIndex, openedInstanceId,
                     name, reason);
     }
@@ -181,6 +191,7 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads(const char* rea
         auto replacement = nextGamepads.find(instanceId);
         if (replacement == nextGamepads.end() || replacement->second.gamepad != record.gamepad) {
             CloseGamepad(instanceId, record, reason);
+            changed = true;
         }
     }
 
@@ -204,6 +215,7 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads(const char* rea
     mConnectedSDLGamepads = std::move(nextGamepads);
     mLastReconcileTicks = SDL_GetTicks64();
     mNeedsReconcile = false;
+    return changed;
 }
 
 bool ConnectedPhysicalDeviceManager::ReconcileIfNeeded(const char* reason) {
@@ -211,8 +223,9 @@ bool ConnectedPhysicalDeviceManager::ReconcileIfNeeded(const char* reason) {
     if (!mNeedsReconcile && now - mLastReconcileTicks < ActiveReconcileIntervalMs) {
         return false;
     }
-    RefreshConnectedSDLGamepads(reason);
-    return true;
+    // The periodic check usually finds the same handles; report only real changes so
+    // listeners (the ImGui gamepad binding) do not re-enumerate every second.
+    return RefreshConnectedSDLGamepads(reason);
 }
 
 } // namespace Ship

@@ -374,6 +374,10 @@ struct StereoParams {
     float convergence = 250.0f;
     // Crossed disparity of the HUD (ortho projections, rectangles), as a fraction of the image width.
     float hudParallax = 0.0f;
+    // Follow the game's convergence hint (gSPStereoConvergence) instead of the fixed convergence.
+    bool dynamicConvergence = true;
+    // Largest crossed disparity of world geometry, as a multiple of parallax (very near geometry is clamped).
+    float crossedLimit = 1.0f;
 };
 
 struct MaskedTextureEntry {
@@ -455,6 +459,9 @@ class Interpreter {
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void ApplyStereoProjection(float matrix[4][4]);
+    void GfxSpStereo(uint32_t op, uint32_t flags, uint32_t value);
+    void SetStereoSky(bool sky);
+    void ApplyStereoSkyTerms(float matrix[4][4], float sign);
     int EyeFb(int fbId);
     void UpdateGameFramebuffers();
     void GfxSpPopMatrix(uint32_t count);
@@ -567,6 +574,19 @@ class Interpreter {
     int mGameFbMsaaResolvedEyes[2]{};
     std::unordered_map<int, int> mEyeFbAliases;        // game FB id -> its eye 1 copy
     std::vector<bool*> mStereoPendingCopies;           // copyOnce flags eye 0 copied this frame
+    // Stereo hints from the display list (G_SETSTEREO), reset at the start of every Run.
+    bool mStereoNextProjHud = false; // the next projection load is interface
+    bool mStereoSky = false;         // between G_STEREO_SKY_BEGIN and _END
+    // Eye terms of the current projection: clip x += mStereoProjC + mStereoProjK·w (C is removed while sky).
+    float mStereoProjC = 0.0f;
+    float mStereoProjK = 0.0f;
+    bool mStereoProjWorld = false;       // the crossed-disparity clamp applies (world perspective)
+    bool mStereoProjPerspective = false; // sky mode applies
+    // Dynamic convergence (game hint), smoothed across frames by eye 0.
+    bool mConvergenceTagged = false; // a hint was seen this frame
+    float mConvergenceTarget = 0.0f;
+    float mConvergenceSmoothed = 0.0f;
+    double mConvergenceTime = 0.0; // seconds, steady clock, of the last update
 
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?
