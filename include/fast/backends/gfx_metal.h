@@ -14,6 +14,12 @@
 #include <simd/simd.h>
 
 static constexpr size_t kMaxVertexBufferPoolSize = 3;
+// Room for one frame of triangles per buffer, per eye on visionOS (stereo renders two passes).
+#ifdef __VISIONOS__
+static constexpr size_t kVertexBufferSize = 256 * 32 * 3 * sizeof(float) * 50 * 2;
+#else
+static constexpr size_t kVertexBufferSize = 256 * 32 * 3 * sizeof(float) * 50;
+#endif
 static constexpr size_t METAL_MAX_MULTISAMPLE_SAMPLE_COUNT = 8;
 static constexpr size_t MAX_PIXEL_DEPTH_COORDS = 1024;
 // Host mode (visionOS): framebuffer 0 is one offscreen output texture per eye.
@@ -155,6 +161,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void OnResize() override;
     void StartFrame() override;
     void EndFrame() override;
+    void SetEye(int eye, int eyeCount) override;
     void FinishRender() override;
     int CreateFramebuffer() override;
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
@@ -194,7 +201,11 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     bool InitDeviceObjects();
     void SetupScreenFramebuffer(uint32_t width, uint32_t height);
     void SetupHostOutputTexture(int eye, uint32_t width, uint32_t height);
-    void PresentHostOutputs(MTL::CommandBuffer* commandBuffer);
+    void EndEye();
+    void PresentHostOutput(MTL::CommandBuffer* commandBuffer);
+#ifdef __VISIONOS__
+    void DumpHostOutput(int eye, uint64_t frameNumber);
+#endif
     // Elements that only need to be setup once
     SDL_Renderer* mRenderer;
     CA::MetalLayer* mLayer; // CA::MetalLayer*
@@ -251,10 +262,11 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     bool mNonUniformThreadgroupSupported;
 
     // Host mode: framebuffer 0 is mOutputTextures[eye] instead of a layer drawable.
-    // Only eye 0 is rendered while the eye count is 1.
+    // Stereo renders the eyes one after the other (SetEye); mono only uses eye 0.
     bool mHostMode = false;
     MTL::Texture* mOutputTextures[METAL_MAX_OUTPUT_EYES] = {};
     int mCurrentEye = 0;
+    int mEyeCount = 1;
     uint64_t mHostFrameIndex = 0;
 };
 

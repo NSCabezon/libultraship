@@ -2,10 +2,12 @@
 
 #include "fast/backends/gfx_host_backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <stdlib.h>
 #include <time.h>
 
 #include <SDL.h>
@@ -58,7 +60,6 @@ extern "C" void HP_SetActive(int active) {
     sActiveCondition.notify_all();
 }
 
-// TODO(visionOS stereo): stored only; consumed by the Metal/stereo work.
 extern "C" void HP_SetEyeCount(int count) {
     sEyeCount = count < 1 ? 1 : (count > 2 ? 2 : count);
 }
@@ -82,6 +83,23 @@ void GfxWindowBackendHost::GetDrawableSize(uint32_t* width, uint32_t* height) {
 
 float GfxWindowBackendHost::GetContentScale() {
     return kHostContentScale;
+}
+
+int GfxWindowBackendHost::GetEyeCount() {
+    static const int sOverride = [] {
+        const char* env = getenv("SOH_STEREO_EYES");
+        const int count = env != nullptr ? atoi(env) : 0;
+        if (count > 0) {
+            SPDLOG_INFO("[HostMetal] SOH_STEREO_EYES={} overrides the host eye count", count);
+        }
+        return count > 0 ? std::min(count, 2) : 0;
+    }();
+    return sOverride > 0 ? sOverride : sEyeCount.load();
+}
+
+void GfxWindowBackendHost::GetScreenGeometry(float* widthMeters, float* distanceMeters) {
+    *widthMeters = sScreenWidthMeters;
+    *distanceMeters = sScreenDistanceMeters;
 }
 
 static uint32_t PixelsToPoints(uint32_t pixels) {

@@ -365,6 +365,17 @@ struct FBInfo {
     bool forceFixedAspect;                  // Preserve aspect ratio even if resize is true
 };
 
+// Per-frame stereo settings (see docs/visionos-stereo-design.md). Only used when eyeCount > 1.
+struct StereoParams {
+    int eyeCount = 1;
+    // Disparity at infinity, as a fraction of the image width (the design's p).
+    float parallax = 0.0f;
+    // Distance with zero disparity (the screen plane), in game units (the design's D).
+    float convergence = 250.0f;
+    // Crossed disparity of the HUD (ortho projections, rectangles), as a fraction of the image width.
+    float hudParallax = 0.0f;
+};
+
 struct MaskedTextureEntry {
     uint8_t* mask;
     uint8_t* replacementData;
@@ -384,6 +395,11 @@ class Interpreter {
     GfxRenderingAPI* GetCurrentRenderingAPI();
     void StartFrame();
     void RunGuiOnly();
+    // Stereo: set once per frame before the eye loop, then SetEye(0..eyeCount-1) before each Run.
+    void SetStereoParams(const StereoParams& params);
+    void SetEye(int eye);
+    // Horizontal HUD offset of the current eye in NDC (0 in mono).
+    float StereoHudOffset() const;
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
     void EndFrame();
     void HandleWindowEvents();
@@ -438,6 +454,9 @@ class Interpreter {
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
+    void ApplyStereoProjection(float matrix[4][4]);
+    int EyeFb(int fbId);
+    void UpdateGameFramebuffers();
     void GfxSpPopMatrix(uint32_t count);
     void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices);
     void GfxSpModifyVertex(uint16_t vtxIdx, uint8_t where, uint32_t val);
@@ -539,6 +558,15 @@ class Interpreter {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
     std::map<std::string, MaskedTextureEntry, std::less<>> mMaskedTextures;
     std::unordered_map<uintptr_t, int> mFbTextures; // CPU addr -> GPU FB id
+
+    // Stereo. The second eye renders into its own copies of the game framebuffers so it does not
+    // clobber eye 0's (incl. copies kept across frames, like the pause background).
+    StereoParams mStereo{};
+    int mEye = 0;
+    int mGameFbEyes[2]{};
+    int mGameFbMsaaResolvedEyes[2]{};
+    std::unordered_map<int, int> mEyeFbAliases;        // game FB id -> its eye 1 copy
+    std::vector<bool*> mStereoPendingCopies;           // copyOnce flags eye 0 copied this frame
 
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?

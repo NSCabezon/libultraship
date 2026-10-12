@@ -8,6 +8,8 @@
 union Gfx;
 #include "interpreter.h"
 
+#include <chrono>
+
 namespace Fast {
 
 /**
@@ -98,6 +100,11 @@ class Fast3dWindow : public Ship::Window {
     static void OnFullscreenChanged(bool isNowFullscreen);
 
   private:
+    static void LogRunTime(std::chrono::steady_clock::duration runTime);
+    static int GetStereoEyeCount();
+    static StereoParams GetStereoParams(int eyeCount);
+    std::chrono::steady_clock::duration RunStereo(int eyeCount, Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements);
+
     GfxRenderingAPI* mRenderingApi;
     GfxWindowBackend* mWindowManagerApi;
     std::shared_ptr<Interpreter> mInterpreter = nullptr;

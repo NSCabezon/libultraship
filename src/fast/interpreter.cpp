@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <stdio.h>
 
+#include <algorithm>
 #include <any>
 #include <map>
 #include <set>
@@ -1219,7 +1220,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         auto fbIt = mFbTextures.find((uintptr_t)origAddr);
         if (fbIt != mFbTextures.end()) {
             Flush();
-            mRapi->SelectTextureFb(fbIt->second);
+            mRapi->SelectTextureFb(EyeFb(fbIt->second));
             mRdp->textures_changed[i] = false;
             return;
         }
@@ -1469,6 +1470,9 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     if (parameters & mtx_projection) {
         if (parameters & mtx_load) {
             memcpy(mRsp->P_matrix, matrix, sizeof(matrix));
+            if (mStereo.eyeCount > 1) {
+                ApplyStereoProjection(mRsp->P_matrix);
+            }
         } else {
             MatrixMul(mRsp->P_matrix, matrix, mRsp->P_matrix);
         }
@@ -1489,6 +1493,37 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
         mRsp->lights_changed = 1;
     }
     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
+}
+
+// Stereo: turns a freshly loaded projection into the current eye's. The game multiplies the viewing
+// matrix onto it afterwards (viewing·P), so the eye offset lands in view space. Row-vector convention.
+//  - Perspective: P' = T(-h)·P·S(k). T moves the eye by h along view x, S shears clip x by k·w so the
+//    convergence distance D has zero disparity (off-axis, no toe-in). Per vertex x' = x - h·P00 + k·w;
+//    y, z and w are unchanged, so depth, fog and clipping stay as in mono.
+//  - Orthographic (HUD): constant horizontal offset (crossed disparity, the HUD floats in front).
+void Interpreter::ApplyStereoProjection(float matrix[4][4]) {
+    const float sigma = mEye == 0 ? -1.0f : 1.0f;
+    // AdjXForAspectRatio scales clip x later; divide it out so disparities are fractions of the image.
+    const float aspectAdj = AdjXForAspectRatio(1.0f);
+
+    if (fabsf(matrix[3][3]) < 1e-6f && matrix[2][3] < -1e-6f) {
+        const float wScale = -matrix[2][3]; // guPerspective scale: w = wScale·distance
+        const float focal = matrix[0][0] / wScale;
+        if (fabsf(focal) < 1e-6f) {
+            return;
+        }
+        // Parallax p at infinity per eye (NDC) gives k; zero disparity at D gives h.
+        const float k = sigma * mStereo.parallax / aspectAdj;
+        const float h = k * mStereo.convergence / focal;
+        for (int j = 0; j < 4; j++) {
+            matrix[3][j] -= h * matrix[0][j];
+        }
+        for (int i = 0; i < 4; i++) {
+            matrix[i][0] += k * matrix[i][3];
+        }
+    } else if (fabsf(matrix[2][3]) < 1e-6f && fabsf(matrix[3][3]) > 1e-6f) {
+        matrix[3][0] += StereoHudOffset() / aspectAdj * matrix[3][3];
+    }
 }
 
 void Interpreter::GfxSpPopMatrix(uint32_t count) {
@@ -2787,6 +2822,12 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     ulxf = AdjXForAspectRatio(ulxf);
     lrxf = AdjXForAspectRatio(lrxf);
 
+    // Stereo: HUD rectangles get the HUD disparity; full-screen ones (fades, backgrounds) do not.
+    if (mStereo.eyeCount > 1 && !mFbActive && (lrx - ulx) < 0.95f * 8.0f * HALF_SCREEN_WIDTH(mActiveFrameBuffer)) {
+        ulxf += StereoHudOffset();
+        lrxf += StereoHudOffset();
+    }
+
     struct LoadedVertex* ul = &mRsp->loaded_vertices[MAX_VERTICES + 0];
     struct LoadedVertex* ll = &mRsp->loaded_vertices[MAX_VERTICES + 1];
     struct LoadedVertex* lr = &mRsp->loaded_vertices[MAX_VERTICES + 2];
@@ -4070,7 +4111,7 @@ bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
     gfx->Flush();
 
     if (cmd->words.w1) {
-        gfx->SetFrameBuffer((int32_t)cmd->words.w1, 1.0f);
+        gfx->SetFrameBuffer(gfx->EyeFb((int32_t)cmd->words.w1), 1.0f);
         gfx->mActiveFrameBuffer = gfx->mFrameBuffers.find((int32_t)cmd->words.w1);
         gfx->mFbActive = true;
     } else {
@@ -4124,6 +4165,10 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
     height = C1(16, 16);
 
     gfx->Flush();
+    // CPU readbacks (e.g. the picto box photo) come from eye 0 only.
+    if (gfx->mEye != 0) {
+        return false;
+    }
     gfx->mRapi->ReadFramebufferToCPU(fbId, width, height, rgba16Buffer);
 
 #ifndef IS_BIGENDIAN
@@ -4174,7 +4219,7 @@ bool gfx_set_timg_fb_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     gfx->Flush();
-    gfx->mRapi->SelectTextureFb((uint32_t)cmd->words.w1);
+    gfx->mRapi->SelectTextureFb(gfx->EyeFb((int32_t)cmd->words.w1));
     gfx->mRdp->textures_changed[0] = false;
     gfx->mRdp->textures_changed[1] = false;
     return false;
@@ -4891,6 +4936,8 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
 
     mGameFb = mRapi->CreateFramebuffer();
     mGameFbMsaaResolved = mRapi->CreateFramebuffer();
+    mGameFbEyes[0] = mGameFb;
+    mGameFbMsaaResolvedEyes[0] = mGameFbMsaaResolved;
 
     mNativeDimensions.width = SCREEN_WIDTH;
     mNativeDimensions.height = SCREEN_HEIGHT;
@@ -4977,6 +5024,9 @@ void Interpreter::StartFrame() {
             }
             if (width != fb.second.applied_width || height != fb.second.applied_height) {
                 mRapi->UpdateFramebufferParameters(fb.first, width, height, 1, true, true, true, true);
+                if (auto alias = mEyeFbAliases.find(fb.first); alias != mEyeFbAliases.end()) {
+                    mRapi->UpdateFramebufferParameters(alias->second, width, height, 1, true, true, true, true);
+                }
                 fb.second.applied_width = width;
                 fb.second.applied_height = height;
             }
@@ -4985,6 +5035,13 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
+    UpdateGameFramebuffers();
+
+    mFbActive = false;
+}
+
+// Sizes the game framebuffers of the current eye for this frame.
+void Interpreter::UpdateGameFramebuffers() {
     if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution()) {
@@ -5003,8 +5060,54 @@ void Interpreter::StartFrame() {
     } else {
         mRendersToFb = false;
     }
+}
 
-    mFbActive = false;
+void Interpreter::SetStereoParams(const StereoParams& params) {
+    mStereo = params;
+}
+
+void Interpreter::SetEye(int eye) {
+    if (eye != 0 && mGameFbEyes[eye] == 0) {
+        mGameFbEyes[eye] = mRapi->CreateFramebuffer();
+        mGameFbMsaaResolvedEyes[eye] = mRapi->CreateFramebuffer();
+    }
+    mEye = eye;
+    mGameFb = mGameFbEyes[eye];
+    mGameFbMsaaResolved = mGameFbMsaaResolvedEyes[eye];
+    if (eye == 0) {
+        mStereoPendingCopies.clear();
+    } else {
+        UpdateGameFramebuffers();
+    }
+    mRapi->SetEye(eye, mStereo.eyeCount);
+}
+
+float Interpreter::StereoHudOffset() const {
+    if (mStereo.eyeCount <= 1) {
+        return 0.0f;
+    }
+    // Left eye right, right eye left: crossed disparity.
+    return (mEye == 0 ? 1.0f : -1.0f) * mStereo.hudParallax;
+}
+
+// Framebuffer the current eye uses for a game framebuffer id: eye 0 uses the game's own,
+// eye 1 a lazily created copy with the same size.
+int Interpreter::EyeFb(int fbId) {
+    if (mEye == 0 || fbId == 0) {
+        return fbId;
+    }
+    if (auto alias = mEyeFbAliases.find(fbId); alias != mEyeFbAliases.end()) {
+        return alias->second;
+    }
+    auto info = mFrameBuffers.find(fbId);
+    if (info == mFrameBuffers.end()) {
+        return fbId;
+    }
+    const int copy = mRapi->CreateFramebuffer();
+    mRapi->UpdateFramebufferParameters(copy, info->second.applied_width, info->second.applied_height, 1, true, true,
+                                       true, true);
+    mEyeFbAliases[fbId] = copy;
+    return copy;
 }
 
 GfxExecStack g_exec_stack = {};
@@ -5116,6 +5219,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
 void Interpreter::EndFrame() {
     mRapi->EndFrame();
+    // Between frames (e.g. GetPixelDepth from game code) the game framebuffers are eye 0's.
+    if (mEye != 0) {
+        mEye = 0;
+        mGameFb = mGameFbEyes[0];
+        mGameFbMsaaResolved = mGameFbMsaaResolvedEyes[0];
+    }
     mWapi->SwapBuffersBegin();
     mRapi->FinishRender();
     mWapi->SwapBuffersEnd();
@@ -5159,10 +5268,22 @@ void Interpreter::SetFrameBuffer(int fb, float noiseScale) {
 }
 
 void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr) {
-    // Do not copy again if we have already copied before
-    if (copyOnce && hasCopiedPtr != nullptr && *hasCopiedPtr) {
+    if (mEye != 0 && copyOnce && hasCopiedPtr != nullptr) {
+        // Later eyes copy once per game frame too: exactly when eye 0 did in this frame.
+        auto pending = std::find(mStereoPendingCopies.begin(), mStereoPendingCopies.end(), hasCopiedPtr);
+        if (pending == mStereoPendingCopies.end()) {
+            return;
+        }
+        mStereoPendingCopies.erase(pending);
+    } else if (copyOnce && hasCopiedPtr != nullptr && *hasCopiedPtr) {
+        // Do not copy again if we have already copied before
         return;
+    } else if (mStereo.eyeCount > 1 && copyOnce && hasCopiedPtr != nullptr) {
+        mStereoPendingCopies.push_back(hasCopiedPtr);
     }
+
+    fb_dst_id = EyeFb(fb_dst_id);
+    fb_src_id = EyeFb(fb_src_id);
 
     if (fb_src_id == 0 && mRendersToFb) {
         // read from the framebuffer we've been rendering to

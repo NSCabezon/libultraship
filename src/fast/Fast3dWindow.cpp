@@ -16,7 +16,15 @@
 
 #include "fast/Fast3dGui.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <fstream>
+
+// Stereo settings (visionOS); only read while the host renders more than one eye.
+#define CVAR_STEREO_ENABLED "gStereo.Enabled"         // 0 = both eyes see the mono image
+#define CVAR_STEREO_DEPTH "gStereo.Depth"             // 0-100 % of the divergence cap (default ~3% parallax)
+#define CVAR_STEREO_CONVERGENCE "gStereo.Convergence" // zero-disparity distance, game units (60-800)
 
 namespace Fast {
 
@@ -233,14 +241,101 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     gui->StartDraw();
     // Setup game framebuffers to match available window space
     mInterpreter->StartFrame();
-    // Execute the games gfx commands
-    mInterpreter->Run(commands, mtxReplacements);
-    // Renders the game frame buffer to the final window and finishes the GUI
-    gui->EndDraw();
+    const int eyeCount = GetStereoEyeCount();
+    if (eyeCount == 1) {
+        // Execute the games gfx commands
+        const auto runStart = std::chrono::steady_clock::now();
+        mInterpreter->Run(commands, mtxReplacements);
+        LogRunTime(std::chrono::steady_clock::now() - runStart);
+        // Renders the game frame buffer to the final window and finishes the GUI
+        gui->EndDraw();
+    } else {
+        LogRunTime(RunStereo(eyeCount, commands, mtxReplacements));
+    }
     // Finalize swap buffers
     mInterpreter->EndFrame();
 
     return true;
+}
+
+int Fast3dWindow::GetStereoEyeCount() {
+#ifdef __VISIONOS__
+    return GfxWindowBackendHost::GetEyeCount();
+#else
+    return 1;
+#endif
+}
+
+// Per-eye stereo parameters from the CVars and the host screen (docs/visionos-stereo-design.md §2).
+StereoParams Fast3dWindow::GetStereoParams(int eyeCount) {
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    // Divergence cap: the disparity at infinity must not exceed the eye separation on the screen.
+    float maxParallax = 0.045f;
+#ifdef __VISIONOS__
+    float screenWidth, screenDistance;
+    GfxWindowBackendHost::GetScreenGeometry(&screenWidth, &screenDistance);
+    if (screenWidth > 0.0f) {
+        maxParallax = std::min(0.063f / screenWidth, 0.1f);
+    }
+#endif
+    const float depth = std::clamp(cvars->GetInteger(CVAR_STEREO_DEPTH, 67), 0, 100) / 100.0f;
+
+    StereoParams params;
+    params.eyeCount = eyeCount;
+    params.parallax = cvars->GetInteger(CVAR_STEREO_ENABLED, 1) ? maxParallax * depth : 0.0f;
+    params.convergence = (float)std::clamp(cvars->GetInteger(CVAR_STEREO_CONVERGENCE, 250), 60, 800);
+    params.hudParallax = params.parallax * 0.3f;
+    return params;
+}
+
+// Stereo frame: runs the display list once per eye. ImGui is built once (gui->EndDraw renders it for
+// eye 0) and its draw data is rendered again for the other eye with that eye's game image.
+// Returns the CPU time spent in Interpreter::Run for all eyes.
+std::chrono::steady_clock::duration Fast3dWindow::RunStereo(int eyeCount, Gfx* commands,
+                                                           const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
+    auto gui = std::dynamic_pointer_cast<Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui());
+    const StereoParams params = GetStereoParams(eyeCount);
+    mInterpreter->SetStereoParams(params);
+
+    // HUD disparity is in NDC; ImGui works in points across the display width.
+    const float halfWidthPoints = ImGui::GetIO().DisplaySize.x / 2.0f;
+    ImTextureID eye0GameTexture = 0;
+    std::chrono::steady_clock::duration runTime{};
+    for (int eye = 0; eye < eyeCount; eye++) {
+        mInterpreter->SetEye(eye);
+        const auto runStart = std::chrono::steady_clock::now();
+        mInterpreter->Run(commands, mtxReplacements);
+        runTime += std::chrono::steady_clock::now() - runStart;
+        const float imguiOffset = mInterpreter->StereoHudOffset() * halfWidthPoints;
+        ImTextureID gameTexture = reinterpret_cast<ImTextureID>(mInterpreter->mGfxFrameBuffer);
+        if (eye == 0) {
+            eye0GameTexture = gameTexture;
+            gui->BeginStereo(imguiOffset);
+            gui->EndDraw();
+        } else {
+            gui->RenderStereoEye(imguiOffset, eye0GameTexture, gameTexture);
+        }
+    }
+    gui->EndStereo();
+    return runTime;
+}
+
+// Debug aid: with SOH_PERF_LOG set, logs the average CPU time of Interpreter::Run per frame
+// (all eyes) every 300 frames.
+void Fast3dWindow::LogRunTime(std::chrono::steady_clock::duration runTime) {
+    static const bool sEnabled = getenv("SOH_PERF_LOG") != nullptr;
+    if (!sEnabled) {
+        return;
+    }
+    static std::chrono::steady_clock::duration sTotal{};
+    static int sFrames = 0;
+    sTotal += runTime;
+    if (++sFrames == 300) {
+        SPDLOG_INFO("[Perf] Interpreter::Run avg {:.3f} ms/frame over {} frames",
+                    std::chrono::duration<double, std::milli>(sTotal).count() / sFrames, sFrames);
+        sTotal = {};
+        sFrames = 0;
+    }
 }
 
 void Fast3dWindow::HandleEvents() {

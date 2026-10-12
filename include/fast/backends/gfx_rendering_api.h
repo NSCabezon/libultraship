@@ -79,6 +79,10 @@ class GfxRenderingAPI {
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
+    // Stereo: the next Run renders this eye (0 = left/mono). Called only when eyeCount > 1, for
+    // eyes 0..eyeCount-1 in order each frame; backends with per-eye outputs finish the previous eye here.
+    virtual void SetEye(int eye, int eyeCount) {
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;

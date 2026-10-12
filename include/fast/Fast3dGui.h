@@ -140,6 +140,19 @@ class Fast3dGui : public Ship::Gui {
 
     void RefreshImGuiGamepads() override;
 
+    /**
+     * @brief Stereo: ImGui is built once per frame. While active, EndDraw renders it for eye 0 with
+     * @p offset (points) added to the x of everything except the game image; RenderStereoEye then
+     * renders the same draw data for each further eye.
+     */
+    void BeginStereo(float offset);
+    /**
+     * @brief Re-renders this frame's ImGui draw data into the current eye's output, with the game image
+     * switched from @p fromGameTexture to @p toGameTexture and the non-game offset set to @p offset.
+     */
+    void RenderStereoEye(float offset, ImTextureID fromGameTexture, ImTextureID toGameTexture);
+    void EndStereo();
+
   protected:
     void ImGuiWMInit() override;
     void ImGuiWMShutdown() override;
@@ -171,6 +184,13 @@ class Fast3dGui : public Ship::Gui {
      * @return Scaling multiplier (1 = native, 2 = 2×, etc.).
      */
     int16_t GetIntegerScaleFactor();
+
+    /** @brief Moves every ImGui vertex horizontally by @p dx except those of the game image. */
+    static void OffsetDrawData(ImDrawData* data, float dx, ImTextureID gameTexture);
+
+    bool mStereoActive = false;       ///< Between BeginStereo and EndStereo.
+    float mStereoOffset = 0.0f;       ///< Offset wanted for the eye being rendered (points).
+    float mStereoAppliedOffset = 0.0f; ///< Offset currently baked into the draw data (points).
 
     std::unordered_map<std::string, Ship::GuiTextureMetadata> mGuiTextures; ///< Cached GPU texture registry.
 };

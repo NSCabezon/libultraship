@@ -41,6 +41,11 @@
 #include "fast/Fast3dWindow.h"
 #ifdef __VISIONOS__
 #include "fast/backends/gfx_host_backend.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <set>
+#include <string>
 #endif
 
 #define ARRAY_COUNT(arr) (int32_t)(sizeof(arr) / sizeof(arr[0]))
@@ -117,7 +122,7 @@ bool GfxRenderingAPIMetal::InitDeviceObjects() {
     mReadbackQueue = mDevice->newCommandQueue();
 
     for (size_t i = 0; i < kMaxVertexBufferPoolSize; i++) {
-        MTL::Buffer* new_buffer = mDevice->newBuffer(256 * 32 * 3 * sizeof(float) * 50, MTL::ResourceStorageModeShared);
+        MTL::Buffer* new_buffer = mDevice->newBuffer(kVertexBufferSize, MTL::ResourceStorageModeShared);
         mVertexBufferPool[i] = new_buffer;
     }
 
@@ -599,6 +604,12 @@ void GfxRenderingAPIMetal::OnResize() {
 }
 
 void GfxRenderingAPIMetal::StartFrame() {
+    // Frame level: Run calls this once per eye, but only eye 0 starts the frame. Later eyes keep
+    // appending to the vertex buffer, so eye 0's vertices stay valid until its GPU work has run.
+    if (mCurrentEye != 0) {
+        return;
+    }
+
     mFrameUniforms.frameCount++;
     if (mFrameUniforms.frameCount > 150) {
         // No high values, as noise starts to look ugly
@@ -617,7 +628,35 @@ void GfxRenderingAPIMetal::StartFrame() {
     mFrameAutoreleasePool = NS::AutoreleasePool::alloc()->init();
 }
 
+void GfxRenderingAPIMetal::SetEye(int eye, int eyeCount) {
+    mEyeCount = eyeCount;
+    if (!mHostMode || eye == mCurrentEye) {
+        return;
+    }
+
+    // Finish the previous eye (commit its framebuffers and present its output) so this eye can
+    // reuse the same framebuffers without clobbering it, then point framebuffer 0 at this eye's output.
+    EndEye();
+    mCurrentEye = eye;
+    const TextureDataMetal& screen = mTextures[mFramebuffers[0].mTextureId];
+    SetupScreenFramebuffer(screen.width, screen.height);
+}
+
 void GfxRenderingAPIMetal::EndFrame() {
+    EndEye();
+
+    mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
+    if (mHostMode) {
+        mHostFrameIndex++;
+    }
+    mCurrentEye = 0;
+    mEyeCount = 1;
+
+    mFrameAutoreleasePool->release();
+}
+
+// Eye level: commits every framebuffer drawn for the current eye and presents its output.
+void GfxRenderingAPIMetal::EndEye() {
     std::set<int>::iterator it = mDrawnFramebuffers.begin();
     it++;
 
@@ -639,7 +678,9 @@ void GfxRenderingAPIMetal::EndFrame() {
     // MTLBuffer using a blit encoder (cheap DMA — no render pass boundary,
     // no TBDR tile flush/reload).  The CPU reads this buffer next frame in
     // ReadFramebufferToCPU and converts BGRA8 → RGBA5551 on the CPU side.
-    if (mScreenReadbackRequested) {
+    // Readbacks belong to eye 0 only.
+    const bool readbackEye = mCurrentEye == 0;
+    if (readbackEye && mScreenReadbackRequested) {
         MTL::Texture* screenTex = mTextures[screen_framebuffer.mTextureId].texture;
         uint32_t w = mScreenReadbackWidth;
         uint32_t h = mScreenReadbackHeight;
@@ -666,19 +707,23 @@ void GfxRenderingAPIMetal::EndFrame() {
     if (mHostMode) {
         // Game and ImGui are composited into the output texture(s); the host encodes
         // its presentation into the same command buffer before it is committed.
-        PresentHostOutputs(screen_framebuffer.mCommandBuffer);
+        PresentHostOutput(screen_framebuffer.mCommandBuffer);
     } else {
         screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
     }
-    mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
     screen_framebuffer.mCommandBuffer->commit();
+#ifdef __VISIONOS__
+    if (mHostMode) {
+        DumpHostOutput(mCurrentEye, mHostFrameIndex + 1);
+    }
+#endif
 
     // Now that commit has been called, retain the command buffer for GPU sync
     // in ReadFramebufferToCPU next frame (waitUntilCompleted before reading).
-    if (mScreenReadbackBuffer && !mScreenReadbackDataReady) {
+    if (readbackEye && mScreenReadbackBuffer && !mScreenReadbackDataReady) {
         mScreenReadbackCmdBuf = screen_framebuffer.mCommandBuffer->retain();
         mScreenReadbackDataReady = true;
-    } else if (mScreenReadbackDataReady && mScreenReadbackCmdBuf) {
+    } else if (readbackEye && mScreenReadbackDataReady && mScreenReadbackCmdBuf) {
         // Nobody consumed the readback this frame — data is going stale.
         // Release the retained command buffer to avoid leaking it, and reset
         // so the next ReadFramebufferToCPU requests a fresh blit instead of
@@ -710,8 +755,6 @@ void GfxRenderingAPIMetal::EndFrame() {
         fb.mLastDepthMask = -1;
         fb.mLastZmodeDecal = -1;
     }
-
-    mFrameAutoreleasePool->release();
 }
 
 void GfxRenderingAPIMetal::FinishRender() {
@@ -772,24 +815,87 @@ void GfxRenderingAPIMetal::SetupHostOutputTexture(int eye, uint32_t width, uint3
     SPDLOG_INFO("[HostMetal] output texture eye {} (re)created: {}x{} px BGRA8Unorm", eye, width, height);
 }
 
-void GfxRenderingAPIMetal::PresentHostOutputs(MTL::CommandBuffer* commandBuffer) {
+#ifdef __VISIONOS__
+// Debug aid: SOH_DUMP_FRAMES="300,600" writes each eye's output texture of those host frames
+// as a binary PPM into SOH_DUMP_DIR (default $HOME/tmp). Used to compare renders pixel by pixel.
+static const std::set<uint64_t>& HostDumpFrames() {
+    static const std::set<uint64_t> sFrames = [] {
+        std::set<uint64_t> frames;
+        const char* env = getenv("SOH_DUMP_FRAMES");
+        for (const char* p = env; p != nullptr && *p != '\0';) {
+            char* end = nullptr;
+            const unsigned long long frame = strtoull(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            frames.insert(frame);
+            p = *end == ',' ? end + 1 : end;
+        }
+        return frames;
+    }();
+    return sFrames;
+}
+
+// Runs after the eye's command buffer was committed: a separate blit on the same queue
+// executes after it, so the frame's own command buffers are left untouched.
+// frameNumber counts frames from 1 (the frame with HPPresentInfo.frameIndex 0 is frame 1).
+void GfxRenderingAPIMetal::DumpHostOutput(int eye, uint64_t frameNumber) {
+    if (HostDumpFrames().count(frameNumber) == 0 || mOutputTextures[eye] == nullptr) {
+        return;
+    }
+    MTL::Texture* output = mOutputTextures[eye];
+    const uint32_t width = (uint32_t)output->width();
+    const uint32_t height = (uint32_t)output->height();
+    MTL::Buffer* pixels = mDevice->newBuffer(width * height * 4, MTL::ResourceStorageModeShared);
+    MTL::CommandBuffer* commandBuffer = mCommandQueue->commandBuffer();
+    MTL::BlitCommandEncoder* blit = commandBuffer->blitCommandEncoder();
+    blit->copyFromTexture(output, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1), pixels, 0, width * 4,
+                          width * height * 4);
+    blit->endEncoding();
+    commandBuffer->commit();
+    commandBuffer->waitUntilCompleted();
+
+    const char* dir = getenv("SOH_DUMP_DIR");
+    const std::string path = fmt::format("{}/frame{}_eye{}.ppm",
+                                         dir != nullptr ? std::string(dir) : std::string(getenv("HOME")) + "/tmp",
+                                         frameNumber, eye);
+    if (FILE* file = fopen(path.c_str(), "wb")) {
+        fprintf(file, "P6\n%u %u\n255\n", width, height);
+        const uint8_t* bgra = (const uint8_t*)pixels->contents();
+        std::vector<uint8_t> rgb(width * 3);
+        for (uint32_t y = 0; y < height; y++) {
+            for (uint32_t x = 0; x < width; x++) {
+                const uint8_t* px = bgra + (y * width + x) * 4;
+                rgb[x * 3 + 0] = px[2];
+                rgb[x * 3 + 1] = px[1];
+                rgb[x * 3 + 2] = px[0];
+            }
+            fwrite(rgb.data(), 1, rgb.size(), file);
+        }
+        fclose(file);
+        SPDLOG_INFO("[HostMetal] dumped {}", path);
+    } else {
+        SPDLOG_ERROR("[HostMetal] could not write {}", path);
+    }
+    pixels->release();
+}
+#endif
+
+// Hands the current eye's output to the host, which encodes its presentation into the eye's
+// command buffer (one present per eye; each eye has its own command buffer).
+void GfxRenderingAPIMetal::PresentHostOutput(MTL::CommandBuffer* commandBuffer) {
 #ifdef __VISIONOS__
     const HPPresenter presenter = GfxWindowBackendHost::GetPresenter();
-    // Only eye 0 is rendered until stereo lands; then this becomes the frame's eye count
-    // and each eye's composition writes mOutputTextures[eye] before this call.
-    const int eyeCount = 1;
+    const int eye = mCurrentEye;
+    const int eyeCount = mEyeCount;
 
     if (presenter.present == nullptr) {
         if (mHostFrameIndex == 0) {
             SPDLOG_INFO("[HostMetal] no presenter installed; committing frames without presenting");
         }
     } else {
-        for (int eye = 0; eye < eyeCount; eye++) {
-            MTL::Texture* output = mOutputTextures[eye];
-            if (output == nullptr) {
-                continue;
-            }
-
+        MTL::Texture* output = mOutputTextures[eye];
+        if (output != nullptr) {
             HPPresentInfo info = {};
             info.texture = output;
             info.commandBuffer = commandBuffer;
@@ -809,7 +915,6 @@ void GfxRenderingAPIMetal::PresentHostOutputs(MTL::CommandBuffer* commandBuffer)
         }
     }
 #endif
-    mHostFrameIndex++;
 }
 
 void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t height) {

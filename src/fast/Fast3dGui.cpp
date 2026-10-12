@@ -435,7 +435,69 @@ void Fast3dGui::RefreshImGuiGamepads() {
     ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_AutoAll, nullptr, 0);
 }
 
+void Fast3dGui::BeginStereo(float offset) {
+    mStereoActive = true;
+    mStereoOffset = offset;
+    mStereoAppliedOffset = 0.0f;
+}
+
+void Fast3dGui::RenderStereoEye(float offset, ImTextureID fromGameTexture, ImTextureID toGameTexture) {
+    ImDrawData* data = ImGui::GetDrawData();
+    if (data == nullptr || !data->Valid) {
+        return;
+    }
+    for (ImDrawList* list : data->CmdLists) {
+        for (ImDrawCmd& cmd : list->CmdBuffer) {
+            if (cmd.TextureId == fromGameTexture) {
+                cmd.TextureId = toGameTexture;
+            }
+        }
+    }
+    OffsetDrawData(data, offset - mStereoAppliedOffset, toGameTexture);
+    mStereoAppliedOffset = offset;
+#ifdef __APPLE__
+    if (mImpl.Backend == WindowBackend::FAST3D_SDL_METAL || mImpl.Backend == WindowBackend::FAST3D_HOST_METAL) {
+        ((GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI())->RenderDrawData(data);
+    }
+#endif
+}
+
+void Fast3dGui::EndStereo() {
+    mStereoActive = false;
+    mStereoOffset = 0.0f;
+    mStereoAppliedOffset = 0.0f;
+}
+
+void Fast3dGui::OffsetDrawData(ImDrawData* data, float dx, ImTextureID gameTexture) {
+    if (dx == 0.0f) {
+        return;
+    }
+    std::vector<bool> isGameVertex;
+    for (ImDrawList* list : data->CmdLists) {
+        isGameVertex.assign(list->VtxBuffer.Size, false);
+        for (const ImDrawCmd& cmd : list->CmdBuffer) {
+            if (cmd.UserCallback != nullptr || cmd.TextureId != gameTexture) {
+                continue;
+            }
+            for (unsigned int i = 0; i < cmd.ElemCount; i++) {
+                isGameVertex[cmd.VtxOffset + list->IdxBuffer[cmd.IdxOffset + i]] = true;
+            }
+        }
+        for (int i = 0; i < list->VtxBuffer.Size; i++) {
+            if (!isGameVertex[i]) {
+                list->VtxBuffer[i].pos.x += dx;
+            }
+        }
+    }
+}
+
 void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
+    if (mStereoActive) {
+        OffsetDrawData(data, mStereoOffset - mStereoAppliedOffset,
+                       reinterpret_cast<ImTextureID>(Ship::Context::GetRawInstance()->GetWindow()->GetGfxFrameBuffer()));
+        mStereoAppliedOffset = mStereoOffset;
+    }
+
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:

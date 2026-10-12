@@ -51,6 +51,11 @@ class GfxWindowBackendHost final : public GfxWindowBackend {
     // like the SDL backend on Apple platforms: pixels / GetContentScale().
     static void GetDrawableSize(uint32_t* width, uint32_t* height);
     static float GetContentScale();
+    // Eyes to render per frame (HP_SetEyeCount). The SOH_STEREO_EYES environment
+    // variable overrides it, for testing stereo without a stereo host.
+    static int GetEyeCount();
+    // Virtual screen geometry in meters (HP_SetScreenGeometry); zero while unknown.
+    static void GetScreenGeometry(float* widthMeters, float* distanceMeters);
 
   private:
     void SyncFramerateWithTime();
