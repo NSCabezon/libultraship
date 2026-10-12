@@ -228,6 +228,13 @@ void Update() {
         sPresent[kRight] = present[kRight];
         sAttachFailed = false;
         SPDLOG_INFO("[Sense] controllers connected: left {}, right {}", present[kLeft], present[kRight]);
+        @autoreleasepool {
+            for (GCController* controller in GCController.controllers) {
+                SPDLOG_INFO("[Sense] visible controller: '{}' category '{}' extendedGamepad {}",
+                            controller.vendorName.UTF8String ?: "?", controller.productCategory.UTF8String ?: "?",
+                            controller.extendedGamepad != nil);
+            }
+        }
     }
 
     const bool wanted = present[kLeft] || present[kRight];
